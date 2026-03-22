@@ -149,7 +149,8 @@ def macd(values, fast=12, slow=26, signal=9):
     signal_line_series = ema_series(macd_line_series, signal)
     hist_series = [m - s for m, s in zip(macd_line_series[-len(signal_line_series):], signal_line_series)]
 
-    return macd_line_series[-1], signal_line_series[-1], hist_series[-1]# ---------- CSV SAFE WRITE ----------
+    return macd_line_series[-1], signal_line_series[-1], hist_series[-1]
+# ---------- CSV SAFE WRITE ----------
 def save_trade(data):
     df = pd.DataFrame([data])
     df.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
@@ -316,7 +317,8 @@ def run_cycle(symbol, interval):
     info["sl"] = sl
     info["size"] = order_size
 
-    return attach_state_snapshot(info, state)# ---------- STREAMLIT UI ----------
+    return attach_state_snapshot(info, state)
+# ---------- STREAMLIT UI ----------
 st.title("OKX Auto Bot + Dashboard + Weekly Report")
 
 symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
@@ -405,5 +407,3 @@ if os.path.exists(CSV_FILE):
     st.line_chart(weekly["pnl"].cumsum())
 else:
     st.write("No weekly data yet.")
-
-
