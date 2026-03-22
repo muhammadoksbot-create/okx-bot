@@ -1,0 +1,5 @@
+API_KEY = "a948a204-3cbe-4855-a711-2d9401973afd"
+SECRET_KEY = "C778702E1A56AD1788146C79967A28F1"
+PASSPHRASE = "Awais@2024"
+
+IS_DEMO = True   # Paper trading ke liye hamesha True
