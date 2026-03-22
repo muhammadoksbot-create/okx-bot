@@ -150,6 +150,7 @@ def macd(values, fast=12, slow=26, signal=9):
     hist_series = [m - s for m, s in zip(macd_line_series[-len(signal_line_series):], signal_line_series)]
 
     return macd_line_series[-1], signal_line_series[-1], hist_series[-1]
+
 # ---------- CSV SAFE WRITE ----------
 def save_trade(data):
     df = pd.DataFrame([data])
@@ -165,7 +166,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE ----------
+# ---------- RUN CYCLE (UPDATED STRATEGY) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -178,7 +179,7 @@ def run_cycle(symbol, interval):
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
 
-    # Indicators
+    # --- Indicators (chart style) ---
     ema9  = ema(closes, 9)
     ema13 = ema(closes, 13)
     ema21 = ema(closes, 21)
@@ -207,7 +208,6 @@ def run_cycle(symbol, interval):
         sl = state["sl"]
         size = state["size"]
 
-        # LONG TP
         if pos == "long" and price >= tp:
             pnl = (tp - entry) * size
             save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
@@ -217,7 +217,6 @@ def run_cycle(symbol, interval):
             info["status"] = "Long TP"
             return attach_state_snapshot(info, state)
 
-        # LONG SL
         if pos == "long" and price <= sl:
             pnl = (sl - entry) * size
             save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
@@ -227,7 +226,6 @@ def run_cycle(symbol, interval):
             info["status"] = "Long SL"
             return attach_state_snapshot(info, state)
 
-        # SHORT TP
         if pos == "short" and price <= tp:
             pnl = (entry - tp) * size
             save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
@@ -237,7 +235,6 @@ def run_cycle(symbol, interval):
             info["status"] = "Short TP"
             return attach_state_snapshot(info, state)
 
-        # SHORT SL
         if pos == "short" and price >= sl:
             pnl = (entry - sl) * size
             save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
@@ -250,24 +247,28 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY ----------
+    # ---------- NEW ENTRY (EMA CROSSOVER + MACD + BREAKOUT) ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
+    # Trend rules
     up_trend = ema9 > ema13 > ema21 > ema55
     down_trend = ema9 < ema13 < ema21 < ema55
 
+    # Breakout levels
     recent_high = max(highs[-3:])
     recent_low  = min(lows[-3:])
 
     side = None
     decision = None
 
+    # LONG ENTRY
     if up_trend and macd_hist > 0 and price > recent_high:
         side = "buy"
         decision = "BUY"
 
+    # SHORT ENTRY
     elif down_trend and macd_hist < 0 and price < recent_low:
         side = "sell"
         decision = "SELL"
@@ -276,6 +277,7 @@ def run_cycle(symbol, interval):
         info["status"] = "No signal"
         return attach_state_snapshot(info, state)
 
+    # ---------- Position Sizing ----------
     balance = get_usdt_balance()
     if balance is None:
         info["status"] = "Balance error"
@@ -289,6 +291,7 @@ def run_cycle(symbol, interval):
     steps = round(raw_size / lot)
     order_size = steps * lot
 
+    # ---------- TP/SL (ATR based) ----------
     if side == "buy":
         sl = price - atr14
         tp = price + atr14 * 2
@@ -318,32 +321,24 @@ def run_cycle(symbol, interval):
     info["size"] = order_size
 
     return attach_state_snapshot(info, state)
+
 # ---------- STREAMLIT UI ----------
 st.title("OKX Auto Bot + Dashboard + Weekly Report")
 
 symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
-loop_time = 20   # seconds
+loop_time = 20
 
-# Session state init
 if "run" not in st.session_state:
     st.session_state.run = False
 
-if "cycle" not in st.session_state:
-    st.session_state.cycle = 0
-
-if "cycle_history" not in st.session_state:
-    st.session_state.cycle_history = []
-
 state = load_state()
 
-# ---------- START / STOP ----------
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Start Auto"):
         st.session_state.run = True
         st.write(set_leverage(symbol, 10))
-
 with col2:
     if st.button("Stop Auto"):
         st.session_state.run = False
@@ -371,28 +366,25 @@ st.subheader("🔁 Manual Cycle")
 if st.button("Run One Cycle"):
     st.json(run_cycle(symbol, interval))
 
-# ---------- AUTO LOOP (SAFE VERSION) ----------
+# ---------- AUTO LOOP ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
 left, right = st.columns([1, 1])
 latest_box = left.empty()
 history_box = right.empty()
+cycle_history = []
 
-# Auto refresh every loop_time seconds ONLY when running
 if st.session_state.run:
-    st_autorefresh = st.experimental_rerun  # fallback safety
-    st_autorefresh = st.autorefresh(interval=loop_time * 1000, limit=None, key="auto_loop")
-
-    # Run one cycle per refresh
-    st.session_state.cycle += 1
-    result = run_cycle(symbol, interval)
-
-    latest_box.markdown(f"### 🔵 Latest Cycle: {st.session_state.cycle}")
-    latest_box.json(result)
-
-    st.session_state.cycle_history.append({"cycle": st.session_state.cycle, **result})
-    history_box.markdown("### 📜 Cycle History")
-    history_box.json(st.session_state.cycle_history)
+    i = 0
+    while st.session_state.run:
+        i += 1
+        res = run_cycle(symbol, interval)
+        latest_box.markdown(f"### 🔵 Latest Cycle: {i}")
+        latest_box.json(res)
+        cycle_history.append({"cycle": i, **res})
+        history_box.markdown("### 📜 Cycle History")
+        history_box.json(cycle_history)
+        time.sleep(loop_time)
 
 # ---------- WEEKLY REPORT ----------
 st.subheader("📅 Weekly Report")
