@@ -166,7 +166,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (UPDATED STRATEGY + SOFTENED) ----------
+# ---------- RUN CYCLE (SOFT STRATEGY) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -179,7 +179,6 @@ def run_cycle(symbol, interval):
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
 
-    # --- Indicators (chart style) ---
     ema9  = ema(closes, 9)
     ema13 = ema(closes, 13)
     ema21 = ema(closes, 21)
@@ -247,7 +246,7 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (SOFTENED EMA + MACD + BREAKOUT) ----------
+    # ---------- NEW ENTRY (SOFTENED) ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
@@ -256,19 +255,17 @@ def run_cycle(symbol, interval):
     up_trend = ema9 > ema21 and ema13 > ema55
     down_trend = ema9 < ema21 and ema13 < ema55
 
-    # Softer breakout levels
+    # Softer breakout
     recent_high = max(highs[-5:])
     recent_low  = min(lows[-5:])
 
     side = None
     decision = None
 
-    # Softer LONG ENTRY
     if up_trend and macd_hist > -0.5 and price > recent_high:
         side = "buy"
         decision = "BUY"
 
-    # Softer SHORT ENTRY
     elif down_trend and macd_hist < 0.5 and price < recent_low:
         side = "sell"
         decision = "SELL"
@@ -277,7 +274,6 @@ def run_cycle(symbol, interval):
         info["status"] = "No signal"
         return attach_state_snapshot(info, state)
 
-    # ---------- Position Sizing ----------
     balance = get_usdt_balance()
     if balance is None:
         info["status"] = "Balance error"
@@ -291,7 +287,6 @@ def run_cycle(symbol, interval):
     steps = round(raw_size / lot)
     order_size = steps * lot
 
-    # ---------- TP/SL (ATR based) ----------
     if side == "buy":
         sl = price - atr14
         tp = price + atr14 * 2
@@ -369,9 +364,9 @@ if st.button("Run One Cycle"):
 # ---------- AUTO LOOP ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
-left, right = st.columns(1)
+left, right = st.columns(2)   # FIXED
 latest_box = left.empty()
-history_box = st.empty()
+history_box = right.empty()
 cycle_history = []
 
 if st.session_state.run:
