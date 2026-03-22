@@ -166,7 +166,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (UPDATED STRATEGY) ----------
+# ---------- RUN CYCLE (UPDATED STRATEGY + SOFTENED) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -247,29 +247,29 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (EMA CROSSOVER + MACD + BREAKOUT) ----------
+    # ---------- NEW ENTRY (SOFTENED EMA + MACD + BREAKOUT) ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
-    # Trend rules
-    up_trend = ema9 > ema13 > ema21 > ema55
-    down_trend = ema9 < ema13 < ema21 < ema55
+    # Softer trend rules
+    up_trend = ema9 > ema21 and ema13 > ema55
+    down_trend = ema9 < ema21 and ema13 < ema55
 
-    # Breakout levels
-    recent_high = max(highs[-3:])
-    recent_low  = min(lows[-3:])
+    # Softer breakout levels
+    recent_high = max(highs[-5:])
+    recent_low  = min(lows[-5:])
 
     side = None
     decision = None
 
-    # LONG ENTRY
-    if up_trend and macd_hist > 0 and price > recent_high:
+    # Softer LONG ENTRY
+    if up_trend and macd_hist > -0.5 and price > recent_high:
         side = "buy"
         decision = "BUY"
 
-    # SHORT ENTRY
-    elif down_trend and macd_hist < 0 and price < recent_low:
+    # Softer SHORT ENTRY
+    elif down_trend and macd_hist < 0.5 and price < recent_low:
         side = "sell"
         decision = "SELL"
 
@@ -369,9 +369,9 @@ if st.button("Run One Cycle"):
 # ---------- AUTO LOOP ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
-left, right = st.columns([1, 1])
+left, right = st.columns(1)
 latest_box = left.empty()
-history_box = right.empty()
+history_box = st.empty()
 cycle_history = []
 
 if st.session_state.run:
