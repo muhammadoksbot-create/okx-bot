@@ -1,329 +1,396 @@
-import time
+import requests
 import hmac
 import base64
-import hashlib
 import json
-from datetime import datetime
-
-import requests
-import numpy as np
+import time
 import streamlit as st
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
+BASE_URL = "https://www.okx.com"
+CSV_FILE = "trade_history.csv"
+STATE_FILE = "state_okx.json"
 
-# ================== CONFIG ==================
-
-OKX_API_KEY = "YOUR_API_KEY"
-OKX_API_SECRET = "YOUR_API_SECRET"
-OKX_PASSPHRASE = "YOUR_PASSPHRASE"
-OKX_BASE_URL = "https://www.okx.com"
-
-SYMBOL = "BTC-USDT-SWAP"
-BAR_INTERVAL = "15m"   # candle timeframe
-TP_MULTIPLIER = 1.0    # ATR multiplier for TP
-SL_MULTIPLIER = 1.0    # ATR multiplier for SL
-ORDER_SIZE = 1         # contract size
-
-
-# ================== OKX HELPERS ==================
-
-def okx_sign(timestamp, method, request_path, body=""):
-    prehash = timestamp + method + request_path + body
+# ---------- SIGN ----------
+def sign(message, secret_key):
     return base64.b64encode(
-        hmac.new(OKX_API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
+        hmac.new(secret_key.encode(), message.encode(), digestmod="sha256").digest()
     ).decode()
 
+# ---------- HEADERS ----------
+def get_headers(method, path, body=""):
+    timestamp = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
+    message = timestamp + method + path + body
+    signature = sign(message, SECRET_KEY)
 
-def okx_headers(timestamp, method, request_path, body=""):
     return {
-        "OK-ACCESS-KEY": OKX_API_KEY,
-        "OK-ACCESS-SIGN": okx_sign(timestamp, method, request_path, body),
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
-        "Content-Type": "application/json"
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json",
+        "X-SIMULATED-TRADING": "1"
     }
 
+# ---------- STATE ----------
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "position": None,
+            "entry": None,
+            "tp": None,
+            "sl": None,
+            "size": None,
+            "symbol": None
+        }
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
 
-def okx_get(path, params=""):
-    ts = str(time.time())
-    method = "GET"
-    request_path = path + (f"?{params}" if params else "")
-    url = OKX_BASE_URL + request_path
-    headers = okx_headers(ts, method, request_path)
-    r = requests.get(url, headers=headers)
-    return r.json()
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
+# ---------- LOT SIZE ----------
+def get_lot_size(symbol):
+    path = f"/api/v5/public/instruments?instType=SWAP&instId={symbol}"
+    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    if r.get("code") == "0" and r.get("data"):
+        return float(r["data"][0]["lotSz"])
+    return 1.0
 
-def okx_post(path, body_dict):
-    ts = str(time.time())
-    method = "POST"
-    request_path = path
-    url = OKX_BASE_URL + request_path
-    body = json.dumps(body_dict)
-    headers = okx_headers(ts, method, request_path, body)
-    r = requests.post(url, headers=headers, data=body)
-    return r.json()
+# ---------- API ----------
+def get_candles(symbol, interval, limit=200):
+    path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
+    return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
 
-
-# ================== MARKET DATA ==================
-
-def get_candles(symbol=SYMBOL, bar=BAR_INTERVAL, limit=100):
-    params = f"instId={symbol}&bar={bar}&limit={limit}"
-    data = okx_get("/api/v5/market/candles", params)
-    candles = data.get("data", [])
-    # OKX returns newest first, reverse to oldest->newest
-    candles = candles[::-1]
-    closes = [float(c[4]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    return np.array(closes), np.array(highs), np.array(lows)
-
-
-# ================== INDICATORS ==================
-
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def compute_indicators():
-    import pandas as pd
-
-    closes, highs, lows = get_candles()
-    if len(closes) < 60:
-        return None
-
-    df = pd.DataFrame({"close": closes, "high": highs, "low": lows})
-
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema13"] = df["close"].ewm(span=13, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
-
-    # ATR14
-    df["prev_close"] = df["close"].shift(1)
-    df["tr1"] = df["high"] - df["low"]
-    df["tr2"] = (df["high"] - df["prev_close"]).abs()
-    df["tr3"] = (df["low"] - df["prev_close"]).abs()
-    df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-    df["atr14"] = df["tr"].rolling(window=14).mean()
-
-    # MACD
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    last = df.iloc[-1]
-
-    return {
-        "price": float(last["close"]),
-        "ema9": float(last["ema9"]),
-        "ema13": float(last["ema13"]),
-        "ema21": float(last["ema21"]),
-        "ema55": float(last["ema55"]),
-        "atr14": float(last["atr14"]),
-        "macd": float(last["macd"]),
-        "macd_signal": float(last["macd_signal"]),
-        "macd_hist": float(last["macd_hist"]),
-    }
-
-
-# ================== POSITION & ORDERS ==================
-
-def check_okx_position(symbol=SYMBOL):
-    params = f"instId={symbol}"
-    data = okx_get("/api/v5/account/positions", params)
-    arr = data.get("data", [])
-    if not arr:
-        return {"status": "no_position"}
-
-    for pos in arr:
-        size = float(pos.get("pos", 0))
-        if size > 0:
-            return {
-                "status": "position",
-                "posSide": pos.get("posSide", ""),
-                "size": size,
-                "avgPx": float(pos.get("avgPx", 0)),
-                "instId": pos.get("instId", symbol)
-            }
-
-    return {"status": "no_position"}
-
-
-def place_market_order(side, size, symbol=SYMBOL):
-    body = {
+def place_order(symbol, side, size):
+    path = "/api/v5/trade/order"
+    body = json.dumps({
         "instId": symbol,
-        "tdMode": "cross",
-        "side": side,          # "buy" or "sell"
+        "tdMode": "isolated",
+        "side": side,
         "ordType": "market",
         "sz": str(size)
-    }
-    return okx_post("/api/v5/trade/order", body)
+    })
+    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
 
+def set_leverage(symbol, lever=10):
+    path = "/api/v5/account/set-leverage"
+    body = json.dumps({
+        "instId": symbol,
+        "lever": str(lever),
+        "mgnMode": "isolated"
+    })
+    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
 
-def close_position(pos_info):
-    pos_side = pos_info["posSide"]
-    size = pos_info["size"]
-    symbol = pos_info["instId"]
+def get_usdt_balance():
+    path = "/api/v5/account/balance"
+    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    if r.get("code") != "0":
+        return None
+    for d in r["data"][0]["details"]:
+        if d["ccy"] == "USDT":
+            return float(d["eq"])
+    return None
 
-    if pos_side == "long":
-        side = "sell"
-    elif pos_side == "short":
-        side = "buy"
-    else:
-        return {"error": "unknown posSide"}
+# ---------- INDICATORS ----------
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
-    return place_market_order(side, size, symbol)
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
+def atr(highs, lows, closes, period=14):
+    if len(highs) < period + 1:
+        return None
+    trs = []
+    for i in range(1, period + 1):
+        high, low, prev_close = highs[i], lows[i], closes[i - 1]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs) / period
 
-# ================== STRATEGY ==================
+def macd(values, fast=12, slow=26, signal=9):
+    if len(values) < slow + signal:
+        return None, None, None
 
-def get_signal(ind):
-    price = ind["price"]
-    ema9 = ind["ema9"]
-    ema21 = ind["ema21"]
-    macd = ind["macd"]
-    macd_signal = ind["macd_signal"]
+    def ema_series(vals, period):
+        k = 2 / (period + 1)
+        e = vals[0]
+        out = [e]
+        for v in vals[1:]:
+            e = v * k + e * (1 - k)
+            out.append(e)
+        return out
 
-    # Simple example logic – tum apni marzi se change kar sakte ho
-    if ema9 > ema21 and macd > macd_signal:
-        return "long"
-    elif ema9 < ema21 and macd < macd_signal:
-        return "short"
-    else:
-        return "none"
+    fast_ema = ema_series(values, fast)
+    slow_ema = ema_series(values, slow)
+    fast_ema = fast_ema[-len(slow_ema):]
+    macd_line_series = [f - s for f, s in zip(fast_ema, slow_ema)]
+    signal_line_series = ema_series(macd_line_series, signal)
+    hist_series = [m - s for m, s in zip(macd_line_series[-len(signal_line_series):], signal_line_series)]
 
+    return macd_line_series[-1], signal_line_series[-1], hist_series[-1]
 
-def calc_tp_sl(ind, direction):
-    price = ind["price"]
-    atr = ind["atr14"]
-    tp_dist = atr * TP_MULTIPLIER
-    sl_dist = atr * SL_MULTIPLIER
+# ---------- CSV SAFE WRITE ----------
+def save_trade(data):
+    df = pd.DataFrame([data])
+    df.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
 
-    if direction == "long":
-        tp = price + tp_dist
-        sl = price - sl_dist
-    else:
-        tp = price - tp_dist
-        sl = price + sl_dist
-
-    return tp, sl
-
-
-# ================== MAIN CYCLE ==================
-
-def run_one_cycle():
-    ind = compute_indicators()
-    if ind is None:
-        return {"error": "Not enough data"}
-
-    pos = check_okx_position()
-
-    # If position exists, just manage it (no opposite trade)
-    if pos["status"] == "position":
-        direction = pos["posSide"]
-        entry = pos["avgPx"]
-        size = pos["size"]
-        price = ind["price"]
-
-        # Simple TP/SL check based on ATR from now price
-        tp, sl = calc_tp_sl(ind, direction)
-
-        status = f"{direction.capitalize()} open"
-        info = {
-            "price": price,
-            "status": status,
-            "position": direction.capitalize(),
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "size": size,
-            "symbol": SYMBOL
-        }
-        return info
-
-    # No position → use strategy
-    signal = get_signal(ind)
-
-    if signal == "none":
-        ind["status"] = "No trade"
-        ind["position"] = "Flat"
-        ind["entry"] = None
-        ind["tp"] = None
-        ind["sl"] = None
-        ind["size"] = 0
-        ind["symbol"] = SYMBOL
-        return ind
-
-    tp, sl = calc_tp_sl(ind, signal)
-
-    if signal == "long":
-        order = place_market_order("buy", ORDER_SIZE)
-        status = "Long open"
-    else:
-        order = place_market_order("sell", ORDER_SIZE)
-        status = "Short open"
-
-    # For demo, we trust order filled near current price
-    info = {
-        "price": ind["price"],
-        "ema9": ind["ema9"],
-        "ema13": ind["ema13"],
-        "ema21": ind["ema21"],
-        "ema55": ind["ema55"],
-        "atr14": ind["atr14"],
-        "macd": ind["macd"],
-        "macd_signal": ind["macd_signal"],
-        "macd_hist": ind["macd_hist"],
-        "status": status,
-        "position": signal.capitalize(),
-        "entry": ind["price"],
-        "tp": tp,
-        "sl": sl,
-        "size": ORDER_SIZE,
-        "symbol": SYMBOL,
-        "order_raw": order
-    }
+# ---------- SNAPSHOT ----------
+def attach_state_snapshot(info, state):
+    info["position"] = state.get("position")
+    info["entry"] = state.get("entry")
+    info["tp"] = state.get("tp")
+    info["sl"] = state.get("sl")
+    info["size"] = state.get("size")
+    info["symbol"] = state.get("symbol")
     return info
 
+# ---------- RUN CYCLE (SOFT STRATEGY) ----------
+def run_cycle(symbol, interval):
+    state = load_state()
 
-# ================== STREAMLIT UI ==================
+    data = get_candles(symbol, interval)
+    if data.get("code") != "0":
+        return attach_state_snapshot({"error": data}, state)
 
-st.set_page_config(page_title="OKX Bot", layout="wide")
+    candles = list(reversed(data["data"]))
+    closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
 
-st.title("🚀 OKX BTC-USDT Bot (Demo + Sync Safe)")
+    ema9  = ema(closes, 9)
+    ema13 = ema(closes, 13)
+    ema21 = ema(closes, 21)
+    ema55 = ema(closes, 55)
+    atr14 = atr(highs, lows, closes, 14)
+    macd_line, macd_signal, macd_hist = macd(closes)
+    price = closes[-1]
+
+    info = {
+        "price": price,
+        "ema9": ema9,
+        "ema13": ema13,
+        "ema21": ema21,
+        "ema55": ema55,
+        "atr14": atr14,
+        "macd": macd_line,
+        "macd_signal": macd_signal,
+        "macd_hist": macd_hist
+    }
+
+    # ---------- MANAGE OPEN POSITION ----------
+    pos = state.get("position")
+    if pos and state.get("symbol") == symbol:
+        entry = state["entry"]
+        tp = state["tp"]
+        sl = state["sl"]
+        size = state["size"]
+
+        if pos == "long" and price >= tp:
+            pnl = (tp - entry) * size
+            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
+                        "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+            state = {k: None for k in state}
+            save_state(state)
+            info["status"] = "Long TP"
+            return attach_state_snapshot(info, state)
+
+        if pos == "long" and price <= sl:
+            pnl = (sl - entry) * size
+            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
+                        "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+            state = {k: None for k in state}
+            save_state(state)
+            info["status"] = "Long SL"
+            return attach_state_snapshot(info, state)
+
+        if pos == "short" and price <= tp:
+            pnl = (entry - tp) * size
+            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
+                        "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+            state = {k: None for k in state}
+            save_state(state)
+            info["status"] = "Short TP"
+            return attach_state_snapshot(info, state)
+
+        if pos == "short" and price >= sl:
+            pnl = (entry - sl) * size
+            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
+                        "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+            state = {k: None for k in state}
+            save_state(state)
+            info["status"] = "Short SL"
+            return attach_state_snapshot(info, state)
+
+        info["status"] = f"{pos} open"
+        return attach_state_snapshot(info, state)
+
+    # ---------- NEW ENTRY (SOFTENED) ----------
+    if state.get("position"):
+        info["status"] = "Position already open"
+        return attach_state_snapshot(info, state)
+
+    # Softer trend rules
+    up_trend = ema9 > ema21 and ema13 > ema55
+    down_trend = ema9 < ema21 and ema13 < ema55
+
+    # Softer breakout
+    recent_high = max(highs[-5:])
+    recent_low  = min(lows[-5:])
+
+    side = None
+    decision = None
+
+    if up_trend and macd_hist > -0.5 and price > recent_high:
+        side = "buy"
+        decision = "BUY"
+
+    elif down_trend and macd_hist < 0.5 and price < recent_low:
+        side = "sell"
+        decision = "SELL"
+
+    if not side:
+        info["status"] = "No signal"
+        return attach_state_snapshot(info, state)
+
+    balance = get_usdt_balance()
+    if balance is None:
+        info["status"] = "Balance error"
+        return attach_state_snapshot(info, state)
+
+    risk = balance * 0.10
+    exposure = risk * 10
+    raw_size = exposure / price
+
+    lot = get_lot_size(symbol)
+    steps = round(raw_size / lot)
+    order_size = steps * lot
+
+    if side == "buy":
+        sl = price - atr14
+        tp = price + atr14 * 2
+        pos_side = "long"
+    else:
+        sl = price + atr14
+        tp = price - atr14 * 2
+        pos_side = "short"
+
+    order = place_order(symbol, side, order_size)
+
+    if order.get("code") == "0":
+        state.update({
+            "position": pos_side,
+            "entry": price,
+            "tp": tp,
+            "sl": sl,
+            "size": order_size,
+            "symbol": symbol
+        })
+        save_state(state)
+
+    info["order"] = order
+    info["decision"] = decision
+    info["tp"] = tp
+    info["sl"] = sl
+    info["size"] = order_size
+
+    return attach_state_snapshot(info, state)
+
+# ---------- STREAMLIT UI ----------
+st.title("OKX Auto Bot + Dashboard + Weekly Report")
+
+symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
+interval = st.selectbox("Interval", ["1m", "5m", "15m"])
+loop_time = 20
+
+if "run" not in st.session_state:
+    st.session_state.run = False
+
+state = load_state()
 
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("Manual Cycle")
-    if st.button("Run One Cycle"):
-        with st.spinner("Running one cycle..."):
-            result = run_one_cycle()
-        st.json(result)
-
+    if st.button("Start Auto"):
+        st.session_state.run = True
+        st.write(set_leverage(symbol, 10))
 with col2:
-    st.subheader("Auto Cycles (24/7 style)")
-    auto = st.checkbox("Enable auto cycles")
-    delay = st.number_input("Delay between cycles (seconds)", min_value=5, max_value=300, value=30)
+    if st.button("Stop Auto"):
+        st.session_state.run = False
 
-    if "auto_log" not in st.session_state:
-        st.session_state.auto_log = []
+st.write("Status:", "RUNNING" if st.session_state.run else "STOPPED")
+st.write("Position:", state.get("position"))
+st.write("Entry:", state.get("entry"))
+st.write("TP:", state.get("tp"))
+st.write("SL:", state.get("sl"))
+st.write("Size:", state.get("size"))
+st.write("State symbol:", state.get("symbol"))
 
-    if auto:
-        st.info("Auto mode ON — page must stay open.")
-        if "last_run" not in st.session_state:
-            st.session_state.last_run = 0
+# ---------- LIVE DASHBOARD ----------
+st.subheader("📊 Live Dashboard")
 
-        now = time.time()
-        if now - st.session_state.last_run >= delay:
-            st.session_state.last_run = now
-            result = run_one_cycle()
-            stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state.auto_log.append({"time": stamp, "data": result})
+if os.path.exists(CSV_FILE):
+    df = pd.read_csv(CSV_FILE, on_bad_lines="skip")
+    st.write(df.tail(10))
+    st.line_chart(df["pnl"].cumsum())
+else:
+    st.write("No trades yet.")
 
-    st.write("Latest auto cycles:")
-    for item in reversed(st.session_state.auto_log[-10:]):
-        st.caption(item["time"])
-        st.json(item["data"])
+# ---------- MANUAL CYCLE ----------
+st.subheader("🔁 Manual Cycle")
+if st.button("Run One Cycle"):
+    st.json(run_cycle(symbol, interval))
+
+# ---------- AUTO LOOP ----------
+st.subheader("🚀 Auto Cycles (24/7)")
+
+left, right = st.columns(2)   # FIXED
+latest_box = left.empty()
+history_box = right.empty()
+cycle_history = []
+
+if st.session_state.run:
+    i = 0
+    while st.session_state.run:
+        i += 1
+        res = run_cycle(symbol, interval)
+        latest_box.markdown(f"### 🔵 Latest Cycle: {i}")
+        latest_box.json(res)
+        cycle_history.append({"cycle": i, **res})
+        history_box.markdown("### 📜 Cycle History")
+        history_box.json(cycle_history)
+        time.sleep(loop_time)
+
+# ---------- WEEKLY REPORT ----------
+st.subheader("📅 Weekly Report")
+
+if os.path.exists(CSV_FILE):
+    df = pd.read_csv(CSV_FILE, on_bad_lines="skip")
+    df["time"] = pd.to_datetime(df["time"])
+    last_week = datetime.utcnow() - timedelta(days=7)
+    weekly = df[df["time"] >= last_week]
+    st.write("Weekly Trades:", len(weekly))
+    st.write("Weekly Profit:", weekly["pnl"].sum())
+    st.line_chart(weekly["pnl"].cumsum())
+else:
+    st.write("No weekly data yet.")
