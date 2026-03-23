@@ -2,7 +2,6 @@ import requests
 import hmac
 import base64
 import json
-import time
 import streamlit as st
 import pandas as pd
 import os
@@ -31,7 +30,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "X-SIMULATED-TRADING": "1"
+        "X-SIMULATED-TRADING": "1"  # LIVE pe le jaate waqt isko "0" karna
     }
 
 # ---------- STATE ----------
@@ -93,6 +92,28 @@ def get_usdt_balance():
     for d in r["data"][0]["details"]:
         if d["ccy"] == "USDT":
             return float(d["eq"])
+    return None
+
+def get_open_position(symbol):
+    """
+    Exchange pe agar koi open position hai,
+    to usko state ke saath sync karne ke liye.
+    """
+    path = "/api/v5/account/positions"
+    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    if r.get("code") != "0":
+        return None
+
+    for p in r.get("data", []):
+        if p.get("instId") == symbol and float(p.get("pos", 0)) != 0:
+            side = "long" if p.get("posSide") == "long" else "short"
+            entry = float(p.get("avgPx", 0))
+            size = abs(float(p.get("pos", 0)))
+            return {
+                "position": side,
+                "entry": entry,
+                "size": size
+            }
     return None
 
 # ---------- INDICATORS ----------
@@ -166,9 +187,33 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (SOFT, 1 TRADE AT A TIME) ----------
+# ---------- RUN CYCLE (SOFT, 1 TRADE AT A TIME + SYNC) ----------
 def run_cycle(symbol, interval):
     state = load_state()
+
+    # --- SYNC WITH EXCHANGE OPEN POSITION ---
+    exch_pos = get_open_position(symbol)
+    if exch_pos and not state.get("position"):
+        # Exchange pe position hai, state me nahi → sync
+        state["position"] = exch_pos["position"]
+        state["entry"] = exch_pos["entry"]
+        state["size"] = exch_pos["size"]
+        state["symbol"] = symbol
+        # TP/SL hum naya calculate kar sakte hain, filhaal None
+        state["tp"] = None
+        state["sl"] = None
+        save_state(state)
+    elif not exch_pos and state.get("position"):
+        # State me position hai, exchange pe nahi → clear
+        state = {
+            "position": None,
+            "entry": None,
+            "tp": None,
+            "sl": None,
+            "size": None,
+            "symbol": None
+        }
+        save_state(state)
 
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
@@ -206,6 +251,11 @@ def run_cycle(symbol, interval):
         tp = state["tp"]
         sl = state["sl"]
         size = state["size"]
+
+        # Agar TP/SL None hain (sync se aaye), to sirf status show karo
+        if tp is None or sl is None:
+            info["status"] = f"{pos} open (no TP/SL set)"
+            return attach_state_snapshot(info, state)
 
         if pos == "long" and price >= tp:
             pnl = (tp - entry) * size
@@ -288,6 +338,10 @@ def run_cycle(symbol, interval):
     steps = round(raw_size / lot)
     order_size = steps * lot
 
+    if order_size <= 0:
+        info["status"] = "Order size too small"
+        return attach_state_snapshot(info, state)
+
     if side == "buy":
         sl = price - atr14
         tp = price + atr14 * 2
@@ -298,6 +352,8 @@ def run_cycle(symbol, interval):
         pos_side = "short"
 
     order = place_order(symbol, side, order_size)
+    info["order"] = order
+    info["decision"] = decision
 
     if order.get("code") == "0":
         state.update({
@@ -309,12 +365,16 @@ def run_cycle(symbol, interval):
             "symbol": symbol
         })
         save_state(state)
-
-    info["order"] = order
-    info["decision"] = decision
-    info["tp"] = tp
-    info["sl"] = sl
-    info["size"] = order_size
+        info["tp"] = tp
+        info["sl"] = sl
+        info["size"] = order_size
+        info["status"] = f"{pos_side} opened"
+    else:
+        # ORDER FAILED → state change nahi, clear message
+        info["tp"] = None
+        info["sl"] = None
+        info["size"] = None
+        info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
 
     return attach_state_snapshot(info, state)
 
@@ -323,7 +383,7 @@ st.title("OKX Auto Bot + Dashboard + Weekly Report")
 
 symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
-loop_time = 20  # sirf display/logic ke liye, auto refresh nahi
+loop_time = 20  # sirf display ke liye
 
 if "run" not in st.session_state:
     st.session_state.run = False
