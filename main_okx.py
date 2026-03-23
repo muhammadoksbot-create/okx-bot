@@ -103,7 +103,18 @@ def get_open_position(symbol):
                 "size": size
             }
     return None
-    # ---------- INDICATORS ----------
+
+def get_usdt_balance():
+    path = "/api/v5/account/balance"
+    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    if r.get("code") != "0":
+        return None
+    for d in r["data"][0]["details"]:
+        if d["ccy"] == "USDT":
+            return float(d["eq"])
+    return None
+
+# ---------- INDICATORS ----------
 def ema(values, period):
     if len(values) < period:
         return None
@@ -231,7 +242,15 @@ def run_cycle(symbol, interval):
             if price >= tp:
                 close_position(symbol, pos, size)
                 pnl = (tp - entry) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "entry": entry,
+                    "exit": tp,
+                    "pnl": pnl,
+                    "result": "TP HIT"
+                })
                 state = {k: None for k in state}
                 save_state(state)
                 info["status"] = "LONG TP HIT"
@@ -240,7 +259,15 @@ def run_cycle(symbol, interval):
             if price <= sl:
                 close_position(symbol, pos, size)
                 pnl = (sl - entry) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "entry": entry,
+                    "exit": sl,
+                    "pnl": pnl,
+                    "result": "SL HIT"
+                })
                 state = {k: None for k in state}
                 save_state(state)
                 info["status"] = "LONG SL HIT"
@@ -251,7 +278,15 @@ def run_cycle(symbol, interval):
             if price <= tp:
                 close_position(symbol, pos, size)
                 pnl = (entry - tp) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "SHORT",
+                    "entry": entry,
+                    "exit": tp,
+                    "pnl": pnl,
+                    "result": "TP HIT"
+                })
                 state = {k: None for k in state}
                 save_state(state)
                 info["status"] = "SHORT TP HIT"
@@ -260,7 +295,15 @@ def run_cycle(symbol, interval):
             if price >= sl:
                 close_position(symbol, pos, size)
                 pnl = (entry - sl) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "SHORT",
+                    "entry": entry,
+                    "exit": sl,
+                    "pnl": pnl,
+                    "result": "SL HIT"
+                })
                 state = {k: None for k in state}
                 save_state(state)
                 info["status"] = "SHORT SL HIT"
@@ -274,7 +317,7 @@ def run_cycle(symbol, interval):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
-    if macd_hist is None or atr14 is None:
+    if macd_hist is None or atr14 is None or ema9 is None or ema21 is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
 
