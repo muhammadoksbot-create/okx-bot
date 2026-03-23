@@ -30,7 +30,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "X-SIMULATED-TRADING": "1"  # LIVE pe le jaate waqt isko "0" karna
+        "X-SIMULATED-TRADING": "1"  # LIVE pe le jaate waqt "0" karna
     }
 
 # ---------- STATE ----------
@@ -39,8 +39,6 @@ def load_state():
         return {
             "position": None,
             "entry": None,
-            "tp": None,
-            "sl": None,
             "size": None,
             "symbol": None
         }
@@ -64,15 +62,30 @@ def get_candles(symbol, interval, limit=200):
     path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
     return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
 
-def place_order(symbol, side, size):
+def get_ticker(symbol):
+    path = f"/api/v5/market/ticker?instId={symbol}"
+    return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+
+def place_order_with_tp_sl(symbol, side, size, tp, sl):
+    """
+    Market entry + exchange-level TP/SL (OCO style)
+    Trigger type: mark price
+    """
     path = "/api/v5/trade/order"
-    body = json.dumps({
+    body_dict = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": side,
         "ordType": "market",
-        "sz": str(size)
-    })
+        "sz": str(size),
+        "tpTriggerPx": str(tp),
+        "tpOrdPx": "-1",          # -1 = market at trigger
+        "tpTriggerPxType": "mark",
+        "slTriggerPx": str(sl),
+        "slOrdPx": "-1",
+        "slTriggerPxType": "mark"
+    }
+    body = json.dumps(body_dict)
     return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
 
 def set_leverage(symbol, lever=10):
@@ -97,7 +110,7 @@ def get_usdt_balance():
 def get_open_position(symbol):
     """
     Exchange pe agar koi open position hai,
-    to usko state ke saath sync karne ke liye.
+    usko state ke saath sync karne ke liye.
     """
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
@@ -181,13 +194,11 @@ def save_trade(data):
 def attach_state_snapshot(info, state):
     info["position"] = state.get("position")
     info["entry"] = state.get("entry")
-    info["tp"] = state.get("tp")
-    info["sl"] = state.get("sl")
     info["size"] = state.get("size")
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (SOFT, 1 TRADE AT A TIME + SYNC) ----------
+# ---------- RUN CYCLE (EXCHANGE TP/SL + SYNC) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -199,17 +210,12 @@ def run_cycle(symbol, interval):
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
-        # TP/SL hum naya calculate kar sakte hain, filhaal None
-        state["tp"] = None
-        state["sl"] = None
         save_state(state)
     elif not exch_pos and state.get("position"):
         # State me position hai, exchange pe nahi → clear
         state = {
             "position": None,
             "entry": None,
-            "tp": None,
-            "sl": None,
             "size": None,
             "symbol": None
         }
@@ -230,7 +236,13 @@ def run_cycle(symbol, interval):
     ema55 = ema(closes, 55)
     atr14 = atr(highs, lows, closes, 14)
     macd_line, macd_signal, macd_hist = macd(closes)
-    price = closes[-1]
+
+    # REAL price (mark) for info
+    ticker = get_ticker(symbol)
+    if ticker.get("code") == "0" and ticker.get("data"):
+        price = float(ticker["data"][0]["last"])
+    else:
+        price = closes[-1]
 
     info = {
         "price": price,
@@ -244,56 +256,10 @@ def run_cycle(symbol, interval):
         "macd_hist": macd_hist
     }
 
-    # ---------- MANAGE OPEN POSITION ----------
+    # ---------- IF POSITION OPEN (EXCHANGE MANAGES TP/SL) ----------
     pos = state.get("position")
     if pos and state.get("symbol") == symbol:
-        entry = state["entry"]
-        tp = state["tp"]
-        sl = state["sl"]
-        size = state["size"]
-
-        # Agar TP/SL None hain (sync se aaye), to sirf status show karo
-        if tp is None or sl is None:
-            info["status"] = f"{pos} open (no TP/SL set)"
-            return attach_state_snapshot(info, state)
-
-        if pos == "long" and price >= tp:
-            pnl = (tp - entry) * size
-            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
-                        "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
-            state = {k: None for k in state}
-            save_state(state)
-            info["status"] = "Long TP"
-            return attach_state_snapshot(info, state)
-
-        if pos == "long" and price <= sl:
-            pnl = (sl - entry) * size
-            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG",
-                        "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
-            state = {k: None for k in state}
-            save_state(state)
-            info["status"] = "Long SL"
-            return attach_state_snapshot(info, state)
-
-        if pos == "short" and price <= tp:
-            pnl = (entry - tp) * size
-            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
-                        "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
-            state = {k: None for k in state}
-            save_state(state)
-            info["status"] = "Short TP"
-            return attach_state_snapshot(info, state)
-
-        if pos == "short" and price >= sl:
-            pnl = (entry - sl) * size
-            save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT",
-                        "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
-            state = {k: None for k in state}
-            save_state(state)
-            info["status"] = "Short SL"
-            return attach_state_snapshot(info, state)
-
-        info["status"] = f"{pos} open"
+        info["status"] = f"{pos} open (TP/SL on exchange)"
         return attach_state_snapshot(info, state)
 
     # ---------- NEW ENTRY (SOFT STRATEGY) ----------
@@ -342,16 +308,21 @@ def run_cycle(symbol, interval):
         info["status"] = "Order size too small"
         return attach_state_snapshot(info, state)
 
+    # ATR-based TP/SL (2x TP, 1x SL)
+    if atr14 is None:
+        info["status"] = "No ATR"
+        return attach_state_snapshot(info, state)
+
     if side == "buy":
-        sl = price - atr14
+        sl = price - atr14 * 1
         tp = price + atr14 * 2
         pos_side = "long"
     else:
-        sl = price + atr14
+        sl = price + atr14 * 1
         tp = price - atr14 * 2
         pos_side = "short"
 
-    order = place_order(symbol, side, order_size)
+    order = place_order_with_tp_sl(symbol, side, order_size, tp, sl)
     info["order"] = order
     info["decision"] = decision
 
@@ -359,21 +330,12 @@ def run_cycle(symbol, interval):
         state.update({
             "position": pos_side,
             "entry": price,
-            "tp": tp,
-            "sl": sl,
             "size": order_size,
             "symbol": symbol
         })
         save_state(state)
-        info["tp"] = tp
-        info["sl"] = sl
-        info["size"] = order_size
-        info["status"] = f"{pos_side} opened"
+        info["status"] = f"{pos_side} opened (TP/SL on exchange)"
     else:
-        # ORDER FAILED → state change nahi, clear message
-        info["tp"] = None
-        info["sl"] = None
-        info["size"] = None
         info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
 
     return attach_state_snapshot(info, state)
@@ -406,8 +368,6 @@ with col2:
 st.write("Status:", "RUNNING" if st.session_state.run else "STOPPED")
 st.write("Position:", state.get("position"))
 st.write("Entry:", state.get("entry"))
-st.write("TP:", state.get("tp"))
-st.write("SL:", state.get("sl"))
 st.write("Size:", state.get("size"))
 st.write("State symbol:", state.get("symbol"))
 
@@ -426,7 +386,7 @@ st.subheader("🔁 Manual Cycle")
 if st.button("Run One Cycle"):
     st.json(run_cycle(symbol, interval))
 
-# ---------- AUTO LOOP (OPTION A: BUTTON-BASED AUTO) ----------
+# ---------- AUTO LOOP ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
 left, right = st.columns([1, 1])
