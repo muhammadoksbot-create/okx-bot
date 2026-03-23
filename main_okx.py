@@ -30,7 +30,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "X-SIMULATED-TRADING": "1"  # LIVE pe le jaate waqt "0" karna
+        "X-SIMULATED-TRADING": "1"
     }
 
 # ---------- STATE ----------
@@ -39,6 +39,8 @@ def load_state():
         return {
             "position": None,
             "entry": None,
+            "tp": None,
+            "sl": None,
             "size": None,
             "symbol": None
         }
@@ -62,56 +64,29 @@ def get_candles(symbol, interval, limit=200):
     path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
     return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
 
-def get_ticker(symbol):
+def get_mark_price(symbol):
     path = f"/api/v5/market/ticker?instId={symbol}"
-    return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+    if r.get("code") == "0" and r.get("data"):
+        return float(r["data"][0]["last"])
+    return None
 
-def place_order_with_tp_sl(symbol, side, size, tp, sl):
-    """
-    Market entry + exchange-level TP/SL (OCO style)
-    Trigger type: mark price
-    """
+def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
-    body_dict = {
+    body = json.dumps({
         "instId": symbol,
         "tdMode": "isolated",
         "side": side,
         "ordType": "market",
-        "sz": str(size),
-        "tpTriggerPx": str(tp),
-        "tpOrdPx": "-1",          # -1 = market at trigger
-        "tpTriggerPxType": "mark",
-        "slTriggerPx": str(sl),
-        "slOrdPx": "-1",
-        "slTriggerPxType": "mark"
-    }
-    body = json.dumps(body_dict)
-    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
-
-def set_leverage(symbol, lever=10):
-    path = "/api/v5/account/set-leverage"
-    body = json.dumps({
-        "instId": symbol,
-        "lever": str(lever),
-        "mgnMode": "isolated"
+        "sz": str(size)
     })
     return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
 
-def get_usdt_balance():
-    path = "/api/v5/account/balance"
-    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-    if r.get("code") != "0":
-        return None
-    for d in r["data"][0]["details"]:
-        if d["ccy"] == "USDT":
-            return float(d["eq"])
-    return None
+def close_position(symbol, side, size):
+    opposite = "sell" if side == "long" else "buy"
+    return place_market_order(symbol, opposite, size)
 
 def get_open_position(symbol):
-    """
-    Exchange pe agar koi open position hai,
-    usko state ke saath sync karne ke liye.
-    """
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") != "0":
@@ -128,8 +103,7 @@ def get_open_position(symbol):
                 "size": size
             }
     return None
-
-# ---------- INDICATORS ----------
+    # ---------- INDICATORS ----------
 def ema(values, period):
     if len(values) < period:
         return None
@@ -138,21 +112,6 @@ def ema(values, period):
     for v in values[1:]:
         e = v * k + e * (1 - k)
     return e
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
 def atr(highs, lows, closes, period=14):
     if len(highs) < period + 1:
@@ -185,7 +144,7 @@ def macd(values, fast=12, slow=26, signal=9):
 
     return macd_line_series[-1], signal_line_series[-1], hist_series[-1]
 
-# ---------- CSV SAFE WRITE ----------
+# ---------- CSV SAVE ----------
 def save_trade(data):
     df = pd.DataFrame([data])
     df.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
@@ -194,33 +153,39 @@ def save_trade(data):
 def attach_state_snapshot(info, state):
     info["position"] = state.get("position")
     info["entry"] = state.get("entry")
+    info["tp"] = state.get("tp")
+    info["sl"] = state.get("sl")
     info["size"] = state.get("size")
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (EXCHANGE TP/SL + SYNC) ----------
+# ---------- RUN CYCLE (STABLE INTERNAL TP/SL) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
-    # --- SYNC WITH EXCHANGE OPEN POSITION ---
+    # --- SYNC WITH EXCHANGE ---
     exch_pos = get_open_position(symbol)
     if exch_pos and not state.get("position"):
-        # Exchange pe position hai, state me nahi → sync
         state["position"] = exch_pos["position"]
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
+        state["tp"] = None
+        state["sl"] = None
         save_state(state)
+
     elif not exch_pos and state.get("position"):
-        # State me position hai, exchange pe nahi → clear
         state = {
             "position": None,
             "entry": None,
+            "tp": None,
+            "sl": None,
             "size": None,
             "symbol": None
         }
         save_state(state)
 
+    # --- GET DATA ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return attach_state_snapshot({"error": data}, state)
@@ -231,44 +196,90 @@ def run_cycle(symbol, interval):
     lows   = [float(c[3]) for c in candles]
 
     ema9  = ema(closes, 9)
-    ema13 = ema(closes, 13)
     ema21 = ema(closes, 21)
-    ema55 = ema(closes, 55)
     atr14 = atr(highs, lows, closes, 14)
     macd_line, macd_signal, macd_hist = macd(closes)
 
-    # REAL price (mark) for info
-    ticker = get_ticker(symbol)
-    if ticker.get("code") == "0" and ticker.get("data"):
-        price = float(ticker["data"][0]["last"])
-    else:
+    price = get_mark_price(symbol)
+    if price is None:
         price = closes[-1]
 
     info = {
         "price": price,
         "ema9": ema9,
-        "ema13": ema13,
         "ema21": ema21,
-        "ema55": ema55,
         "atr14": atr14,
         "macd": macd_line,
         "macd_signal": macd_signal,
         "macd_hist": macd_hist
     }
 
-    # ---------- IF POSITION OPEN (EXCHANGE MANAGES TP/SL) ----------
+    # ---------- MANAGE OPEN POSITION ----------
     pos = state.get("position")
-    if pos and state.get("symbol") == symbol:
-        info["status"] = f"{pos} open (TP/SL on exchange)"
+    if pos:
+        entry = state["entry"]
+        tp = state["tp"]
+        sl = state["sl"]
+        size = state["size"]
+
+        if tp is None or sl is None:
+            info["status"] = f"{pos} open (TP/SL not set yet)"
+            return attach_state_snapshot(info, state)
+
+        # LONG CLOSE
+        if pos == "long":
+            if price >= tp:
+                close_position(symbol, pos, size)
+                pnl = (tp - entry) * size
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                state = {k: None for k in state}
+                save_state(state)
+                info["status"] = "LONG TP HIT"
+                return attach_state_snapshot(info, state)
+
+            if price <= sl:
+                close_position(symbol, pos, size)
+                pnl = (sl - entry) * size
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                state = {k: None for k in state}
+                save_state(state)
+                info["status"] = "LONG SL HIT"
+                return attach_state_snapshot(info, state)
+
+        # SHORT CLOSE
+        if pos == "short":
+            if price <= tp:
+                close_position(symbol, pos, size)
+                pnl = (entry - tp) * size
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                state = {k: None for k in state}
+                save_state(state)
+                info["status"] = "SHORT TP HIT"
+                return attach_state_snapshot(info, state)
+
+            if price >= sl:
+                close_position(symbol, pos, size)
+                pnl = (entry - sl) * size
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                state = {k: None for k in state}
+                save_state(state)
+                info["status"] = "SHORT SL HIT"
+                return attach_state_snapshot(info, state)
+
+        info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (SOFT STRATEGY) ----------
+    # ---------- NEW ENTRY ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
-    up_trend = ema9 is not None and ema21 is not None and ema9 > ema21
-    down_trend = ema9 is not None and ema21 is not None and ema9 < ema21
+    if macd_hist is None or atr14 is None:
+        info["status"] = "Indicators not ready"
+        return attach_state_snapshot(info, state)
+
+    up = ema9 > ema21
+    down = ema9 < ema21
 
     recent_high = max(highs[-8:])
     recent_low  = min(lows[-8:])
@@ -276,14 +287,10 @@ def run_cycle(symbol, interval):
     side = None
     decision = None
 
-    if macd_hist is None:
-        info["status"] = "No MACD"
-        return attach_state_snapshot(info, state)
-
-    if up_trend and macd_hist > -1 and price > recent_high * 0.998:
+    if up and macd_hist > -1 and price > recent_high * 0.998:
         side = "buy"
         decision = "BUY"
-    elif down_trend and macd_hist < 1 and price < recent_low * 1.002:
+    elif down and macd_hist < 1 and price < recent_low * 1.002:
         side = "sell"
         decision = "SELL"
 
@@ -308,21 +315,17 @@ def run_cycle(symbol, interval):
         info["status"] = "Order size too small"
         return attach_state_snapshot(info, state)
 
-    # ATR-based TP/SL (2x TP, 1x SL)
-    if atr14 is None:
-        info["status"] = "No ATR"
-        return attach_state_snapshot(info, state)
-
+    # ATR TP/SL
     if side == "buy":
-        sl = price - atr14 * 1
+        sl = price - atr14
         tp = price + atr14 * 2
         pos_side = "long"
     else:
-        sl = price + atr14 * 1
+        sl = price + atr14
         tp = price - atr14 * 2
         pos_side = "short"
 
-    order = place_order_with_tp_sl(symbol, side, order_size, tp, sl)
+    order = place_market_order(symbol, side, order_size)
     info["order"] = order
     info["decision"] = decision
 
@@ -330,29 +333,28 @@ def run_cycle(symbol, interval):
         state.update({
             "position": pos_side,
             "entry": price,
+            "tp": tp,
+            "sl": sl,
             "size": order_size,
             "symbol": symbol
         })
         save_state(state)
-        info["status"] = f"{pos_side} opened (TP/SL on exchange)"
+        info["status"] = f"{pos_side} opened"
     else:
         info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
 
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot + Dashboard + Weekly Report")
+st.title("OKX Auto Bot — Stable Internal TP/SL Version")
 
-symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
+symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
-loop_time = 20  # sirf display ke liye
 
 if "run" not in st.session_state:
     st.session_state.run = False
 if "cycle" not in st.session_state:
     st.session_state.cycle = 0
-if "cycle_history" not in st.session_state:
-    st.session_state.cycle_history = []
 
 state = load_state()
 
@@ -360,7 +362,6 @@ col1, col2 = st.columns(2)
 with col1:
     if st.button("Start Auto"):
         st.session_state.run = True
-        st.write(set_leverage(symbol, 10))
 with col2:
     if st.button("Stop Auto"):
         st.session_state.run = False
@@ -368,62 +369,21 @@ with col2:
 st.write("Status:", "RUNNING" if st.session_state.run else "STOPPED")
 st.write("Position:", state.get("position"))
 st.write("Entry:", state.get("entry"))
+st.write("TP:", state.get("tp"))
+st.write("SL:", state.get("sl"))
 st.write("Size:", state.get("size"))
-st.write("State symbol:", state.get("symbol"))
 
-# ---------- LIVE DASHBOARD ----------
-st.subheader("📊 Live Dashboard")
-
-if os.path.exists(CSV_FILE):
-    df = pd.read_csv(CSV_FILE, on_bad_lines="skip")
-    st.write(df.tail(10))
-    st.line_chart(df["pnl"].cumsum())
-else:
-    st.write("No trades yet.")
-
-# ---------- MANUAL CYCLE ----------
-st.subheader("🔁 Manual Cycle")
+st.subheader("Manual Cycle")
 if st.button("Run One Cycle"):
     st.json(run_cycle(symbol, interval))
 
-# ---------- AUTO LOOP ----------
-st.subheader("🚀 Auto Cycles (24/7)")
-
-left, right = st.columns([1, 1])
-latest_box = left.empty()
-history_box = right.empty()
-
-auto_cycles = st.number_input(
-    "Auto cycles per click",
-    min_value=1,
-    max_value=50,
-    value=5,
-    step=1
-)
+st.subheader("Auto Cycles")
+auto_cycles = st.number_input("Cycles per click", 1, 50, 5)
 
 if st.session_state.run:
     if st.button("Run Auto Batch"):
         for _ in range(int(auto_cycles)):
             st.session_state.cycle += 1
-            res = run_cycle(symbol, interval)
-            latest_box.markdown(f"### 🔵 Latest Cycle: {st.session_state.cycle}")
-            latest_box.json(res)
-            st.session_state.cycle_history.append({"cycle": st.session_state.cycle, **res})
-        history_box.markdown("### 📜 Cycle History")
-        history_box.json(st.session_state.cycle_history)
+            st.json(run_cycle(symbol, interval))
 else:
-    st.info("Auto is STOPPED. Start Auto above to enable batch cycles.")
-
-# ---------- WEEKLY REPORT ----------
-st.subheader("📅 Weekly Report")
-
-if os.path.exists(CSV_FILE):
-    df = pd.read_csv(CSV_FILE, on_bad_lines="skip")
-    df["time"] = pd.to_datetime(df["time"])
-    last_week = datetime.utcnow() - timedelta(days=7)
-    weekly = df[df["time"] >= last_week]
-    st.write("Weekly Trades:", len(weekly))
-    st.write("Weekly Profit:", weekly["pnl"].sum())
-    st.line_chart(weekly["pnl"].cumsum())
-else:
-    st.write("No weekly data yet.")
+    st.info("Auto stopped.")
