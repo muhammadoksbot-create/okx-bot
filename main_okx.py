@@ -166,7 +166,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (SOFT STRATEGY) ----------
+# ---------- RUN CYCLE (SOFT, 1 TRADE AT A TIME) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -246,27 +246,33 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (SOFTENED) ----------
+    # ---------- NEW ENTRY (SOFT STRATEGY) ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
     # Softer trend rules
-    up_trend = ema9 > ema21 and ema13 > ema55
-    down_trend = ema9 < ema21 and ema13 < ema55
+    up_trend = ema9 is not None and ema21 is not None and ema9 > ema21
+    down_trend = ema9 is not None and ema21 is not None and ema9 < ema21
 
-    # Softer breakout
-    recent_high = max(highs[-5:])
-    recent_low  = min(lows[-5:])
+    # Softer breakout levels
+    recent_high = max(highs[-8:])
+    recent_low  = min(lows[-8:])
 
     side = None
     decision = None
 
-    if up_trend and macd_hist > -0.5 and price > recent_high:
+    if macd_hist is None:
+        info["status"] = "No MACD"
+        return attach_state_snapshot(info, state)
+
+    # Softer LONG ENTRY
+    if up_trend and macd_hist > -1 and price > recent_high * 0.998:
         side = "buy"
         decision = "BUY"
 
-    elif down_trend and macd_hist < 0.5 and price < recent_low:
+    # Softer SHORT ENTRY
+    elif down_trend and macd_hist < 1 and price < recent_low * 1.002:
         side = "sell"
         decision = "SELL"
 
@@ -326,6 +332,10 @@ loop_time = 20
 
 if "run" not in st.session_state:
     st.session_state.run = False
+if "cycle" not in st.session_state:
+    st.session_state.cycle = 0
+if "cycle_history" not in st.session_state:
+    st.session_state.cycle_history = []
 
 state = load_state()
 
@@ -361,25 +371,22 @@ st.subheader("🔁 Manual Cycle")
 if st.button("Run One Cycle"):
     st.json(run_cycle(symbol, interval))
 
-# ---------- AUTO LOOP ----------
+# ---------- AUTO LOOP (STREAMLIT-SAFE) ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
-left, right = st.columns(2)   # FIXED
+left, right = st.columns([1, 1])
 latest_box = left.empty()
 history_box = right.empty()
-cycle_history = []
 
 if st.session_state.run:
-    i = 0
-    while st.session_state.run:
-        i += 1
-        res = run_cycle(symbol, interval)
-        latest_box.markdown(f"### 🔵 Latest Cycle: {i}")
-        latest_box.json(res)
-        cycle_history.append({"cycle": i, **res})
-        history_box.markdown("### 📜 Cycle History")
-        history_box.json(cycle_history)
-        time.sleep(loop_time)
+    count = st.autorefresh(interval=loop_time * 1000, key="auto_loop")
+    st.session_state.cycle += 1
+    res = run_cycle(symbol, interval)
+    latest_box.markdown(f"### 🔵 Latest Cycle: {st.session_state.cycle}")
+    latest_box.json(res)
+    st.session_state.cycle_history.append({"cycle": st.session_state.cycle, **res})
+    history_box.markdown("### 📜 Cycle History")
+    history_box.json(st.session_state.cycle_history)
 
 # ---------- WEEKLY REPORT ----------
 st.subheader("📅 Weekly Report")
