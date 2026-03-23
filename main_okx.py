@@ -166,7 +166,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (SOFT STRATEGY) ----------
+# ---------- RUN CYCLE (SOFT, 1 TRADE AT A TIME) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -246,27 +246,28 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (SOFTENED) ----------
+    # ---------- NEW ENTRY (SOFT STRATEGY) ----------
     if state.get("position"):
         info["status"] = "Position already open"
         return attach_state_snapshot(info, state)
 
-    # Softer trend rules
-    up_trend = ema9 > ema21 and ema13 > ema55
-    down_trend = ema9 < ema21 and ema13 < ema55
+    up_trend = ema9 is not None and ema21 is not None and ema9 > ema21
+    down_trend = ema9 is not None and ema21 is not None and ema9 < ema21
 
-    # Softer breakout
-    recent_high = max(highs[-5:])
-    recent_low  = min(lows[-5:])
+    recent_high = max(highs[-8:])
+    recent_low  = min(lows[-8:])
 
     side = None
     decision = None
 
-    if up_trend and macd_hist > -0.5 and price > recent_high:
+    if macd_hist is None:
+        info["status"] = "No MACD"
+        return attach_state_snapshot(info, state)
+
+    if up_trend and macd_hist > -1 and price > recent_high * 0.998:
         side = "buy"
         decision = "BUY"
-
-    elif down_trend and macd_hist < 0.5 and price < recent_low:
+    elif down_trend and macd_hist < 1 and price < recent_low * 1.002:
         side = "sell"
         decision = "SELL"
 
@@ -322,10 +323,14 @@ st.title("OKX Auto Bot + Dashboard + Weekly Report")
 
 symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
-loop_time = 20
+loop_time = 20  # sirf display/logic ke liye, auto refresh nahi
 
 if "run" not in st.session_state:
     st.session_state.run = False
+if "cycle" not in st.session_state:
+    st.session_state.cycle = 0
+if "cycle_history" not in st.session_state:
+    st.session_state.cycle_history = []
 
 state = load_state()
 
@@ -361,25 +366,33 @@ st.subheader("🔁 Manual Cycle")
 if st.button("Run One Cycle"):
     st.json(run_cycle(symbol, interval))
 
-# ---------- AUTO LOOP ----------
+# ---------- AUTO LOOP (OPTION A: BUTTON-BASED AUTO) ----------
 st.subheader("🚀 Auto Cycles (24/7)")
 
-left, right = st.columns(2)   # FIXED
+left, right = st.columns([1, 1])
 latest_box = left.empty()
 history_box = right.empty()
-cycle_history = []
+
+auto_cycles = st.number_input(
+    "Auto cycles per click",
+    min_value=1,
+    max_value=50,
+    value=5,
+    step=1
+)
 
 if st.session_state.run:
-    i = 0
-    while st.session_state.run:
-        i += 1
-        res = run_cycle(symbol, interval)
-        latest_box.markdown(f"### 🔵 Latest Cycle: {i}")
-        latest_box.json(res)
-        cycle_history.append({"cycle": i, **res})
+    if st.button("Run Auto Batch"):
+        for _ in range(int(auto_cycles)):
+            st.session_state.cycle += 1
+            res = run_cycle(symbol, interval)
+            latest_box.markdown(f"### 🔵 Latest Cycle: {st.session_state.cycle}")
+            latest_box.json(res)
+            st.session_state.cycle_history.append({"cycle": st.session_state.cycle, **res})
         history_box.markdown("### 📜 Cycle History")
-        history_box.json(cycle_history)
-        time.sleep(loop_time)
+        history_box.json(st.session_state.cycle_history)
+else:
+    st.info("Auto is STOPPED. Start Auto above to enable batch cycles.")
 
 # ---------- WEEKLY REPORT ----------
 st.subheader("📅 Weekly Report")
