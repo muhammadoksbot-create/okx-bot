@@ -114,6 +114,15 @@ def get_usdt_balance():
             return float(d["eq"])
     return None
 
+def set_leverage(symbol, lever=10):
+    path = "/api/v5/account/set-leverage"
+    body = json.dumps({
+        "instId": symbol,
+        "lever": str(lever),
+        "mgnMode": "isolated"
+    })
+    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
+
 # ---------- INDICATORS ----------
 def ema(values, period):
     if len(values) < period:
@@ -170,33 +179,11 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (STABLE INTERNAL TP/SL) ----------
+# ---------- RUN CYCLE (STRONG SYNC + INTERNAL TP/SL) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
-    # --- SYNC WITH EXCHANGE ---
-    exch_pos = get_open_position(symbol)
-    if exch_pos and not state.get("position"):
-        state["position"] = exch_pos["position"]
-        state["entry"] = exch_pos["entry"]
-        state["size"] = exch_pos["size"]
-        state["symbol"] = symbol
-        state["tp"] = None
-        state["sl"] = None
-        save_state(state)
-
-    elif not exch_pos and state.get("position"):
-        state = {
-            "position": None,
-            "entry": None,
-            "tp": None,
-            "sl": None,
-            "size": None,
-            "symbol": None
-        }
-        save_state(state)
-
-    # --- GET DATA ---
+    # --- GET DATA FIRST (for ATR etc) ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return attach_state_snapshot({"error": data}, state)
@@ -225,6 +212,36 @@ def run_cycle(symbol, interval):
         "macd_hist": macd_hist
     }
 
+    # --- STRONG SYNC WITH EXCHANGE ---
+    exch_pos = get_open_position(symbol)
+    if exch_pos:
+        # Force overwrite state from exchange
+        state["position"] = exch_pos["position"]
+        state["entry"] = exch_pos["entry"]
+        state["size"] = exch_pos["size"]
+        state["symbol"] = symbol
+
+        # Auto-rebuild TP/SL if missing and ATR ready
+        if atr14 is not None and (state.get("tp") is None or state.get("sl") is None):
+            if state["position"] == "long":
+                state["sl"] = state["entry"] - atr14
+                state["tp"] = state["entry"] + atr14 * 2
+            else:
+                state["sl"] = state["entry"] + atr14
+                state["tp"] = state["entry"] - atr14 * 2
+        save_state(state)
+    else:
+        # No position on exchange → clear state
+        state = {
+            "position": None,
+            "entry": None,
+            "tp": None,
+            "sl": None,
+            "size": None,
+            "symbol": None
+        }
+        save_state(state)
+
     # ---------- MANAGE OPEN POSITION ----------
     pos = state.get("position")
     if pos:
@@ -234,7 +251,7 @@ def run_cycle(symbol, interval):
         size = state["size"]
 
         if tp is None or sl is None:
-            info["status"] = f"{pos} open (TP/SL not set yet)"
+            info["status"] = f"{pos} open (TP/SL rebuilding...)"
             return attach_state_snapshot(info, state)
 
         # LONG CLOSE
@@ -251,7 +268,14 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "TP HIT"
                 })
-                state = {k: None for k in state}
+                state = {
+                    "position": None,
+                    "entry": None,
+                    "tp": None,
+                    "sl": None,
+                    "size": None,
+                    "symbol": None
+                }
                 save_state(state)
                 info["status"] = "LONG TP HIT"
                 return attach_state_snapshot(info, state)
@@ -268,7 +292,14 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "SL HIT"
                 })
-                state = {k: None for k in state}
+                state = {
+                    "position": None,
+                    "entry": None,
+                    "tp": None,
+                    "sl": None,
+                    "size": None,
+                    "symbol": None
+                }
                 save_state(state)
                 info["status"] = "LONG SL HIT"
                 return attach_state_snapshot(info, state)
@@ -287,7 +318,14 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "TP HIT"
                 })
-                state = {k: None for k in state}
+                state = {
+                    "position": None,
+                    "entry": None,
+                    "tp": None,
+                    "sl": None,
+                    "size": None,
+                    "symbol": None
+                }
                 save_state(state)
                 info["status"] = "SHORT TP HIT"
                 return attach_state_snapshot(info, state)
@@ -304,7 +342,14 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "SL HIT"
                 })
-                state = {k: None for k in state}
+                state = {
+                    "position": None,
+                    "entry": None,
+                    "tp": None,
+                    "sl": None,
+                    "size": None,
+                    "symbol": None
+                }
                 save_state(state)
                 info["status"] = "SHORT SL HIT"
                 return attach_state_snapshot(info, state)
@@ -389,9 +434,18 @@ def run_cycle(symbol, interval):
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — Stable Internal TP/SL Version")
+st.title("OKX Auto Bot — Strong Sync + Internal TP/SL")
 
-symbol = st.selectbox("Symbol", ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
+symbol = st.selectbox(
+    "Symbol",
+    [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "AAVE-USDT-SWAP",
+        "XRP-USDT-SWAP"
+    ]
+)
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
 
 if "run" not in st.session_state:
@@ -404,6 +458,7 @@ state = load_state()
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Start Auto"):
+        set_leverage(symbol, 10)  # sab pair 10x
         st.session_state.run = True
 with col2:
     if st.button("Stop Auto"):
@@ -415,6 +470,7 @@ st.write("Entry:", state.get("entry"))
 st.write("TP:", state.get("tp"))
 st.write("SL:", state.get("sl"))
 st.write("Size:", state.get("size"))
+st.write("Symbol (state):", state.get("symbol"))
 
 st.subheader("Manual Cycle")
 if st.button("Run One Cycle"):
