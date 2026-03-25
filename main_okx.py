@@ -5,7 +5,7 @@ import json
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
 BASE_URL = "https://www.okx.com"
@@ -34,16 +34,19 @@ def get_headers(method, path, body=""):
     }
 
 # ---------- STATE ----------
+def default_state():
+    return {
+        "position": None,
+        "entry": None,
+        "tp": None,
+        "sl": None,
+        "size": None,
+        "symbol": None
+    }
+
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {
-            "position": None,
-            "entry": None,
-            "tp": None,
-            "sl": None,
-            "size": None,
-            "symbol": None
-        }
+        return default_state()
     with open(STATE_FILE, "r") as f:
         return json.load(f)
 
@@ -86,7 +89,7 @@ def close_position(symbol, side, size):
     opposite = "sell" if side == "long" else "buy"
     return place_market_order(symbol, opposite, size)
 
-def get_open_position(symbol):
+def get_open_position_once(symbol):
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") != "0":
@@ -103,6 +106,22 @@ def get_open_position(symbol):
                 "size": size
             }
     return None
+
+def get_open_position_double_check(symbol):
+    p1 = get_open_position_once(symbol)
+    p2 = get_open_position_once(symbol)
+
+    # dono calls same honi chahiye, warna unsafe
+    if (p1 is None and p2 is None):
+        return None
+    if (p1 is not None and p2 is not None and
+        p1["position"] == p2["position"] and
+        abs(p1["entry"] - p2["entry"]) < 0.5 and
+        abs(p1["size"] - p2["size"]) < 1e-6):
+        return p1
+
+    # mismatch → unsafe, bot trade nahi karega
+    return "MISMATCH"
 
 def get_usdt_balance():
     path = "/api/v5/account/balance"
@@ -179,11 +198,11 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE (STRONG SYNC + INTERNAL TP/SL) ----------
+# ---------- RUN CYCLE ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
-    # --- GET DATA FIRST (for ATR etc) ---
+    # --- GET DATA FIRST ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return attach_state_snapshot({"error": data}, state)
@@ -212,16 +231,20 @@ def run_cycle(symbol, interval):
         "macd_hist": macd_hist
     }
 
-    # --- STRONG SYNC WITH EXCHANGE ---
-    exch_pos = get_open_position(symbol)
+    # --- DOUBLE CHECK EXCHANGE POSITION ---
+    exch_pos = get_open_position_double_check(symbol)
+    if exch_pos == "MISMATCH":
+        info["status"] = "SYNC MISMATCH: blocking new trades"
+        return attach_state_snapshot(info, state)
+
     if exch_pos:
-        # Force overwrite state from exchange
+        # exchange pe jo hai, wahi sach hai
         state["position"] = exch_pos["position"]
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
 
-        # Auto-rebuild TP/SL if missing and ATR ready
+        # TP/SL auto rebuild if missing
         if atr14 is not None and (state.get("tp") is None or state.get("sl") is None):
             if state["position"] == "long":
                 state["sl"] = state["entry"] - atr14
@@ -231,15 +254,8 @@ def run_cycle(symbol, interval):
                 state["tp"] = state["entry"] - atr14 * 2
         save_state(state)
     else:
-        # No position on exchange → clear state
-        state = {
-            "position": None,
-            "entry": None,
-            "tp": None,
-            "sl": None,
-            "size": None,
-            "symbol": None
-        }
+        # exchange pe koi position nahi → state clear
+        state = default_state()
         save_state(state)
 
     # ---------- MANAGE OPEN POSITION ----------
@@ -268,14 +284,7 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "TP HIT"
                 })
-                state = {
-                    "position": None,
-                    "entry": None,
-                    "tp": None,
-                    "sl": None,
-                    "size": None,
-                    "symbol": None
-                }
+                state = default_state()
                 save_state(state)
                 info["status"] = "LONG TP HIT"
                 return attach_state_snapshot(info, state)
@@ -292,14 +301,7 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "SL HIT"
                 })
-                state = {
-                    "position": None,
-                    "entry": None,
-                    "tp": None,
-                    "sl": None,
-                    "size": None,
-                    "symbol": None
-                }
+                state = default_state()
                 save_state(state)
                 info["status"] = "LONG SL HIT"
                 return attach_state_snapshot(info, state)
@@ -318,14 +320,7 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "TP HIT"
                 })
-                state = {
-                    "position": None,
-                    "entry": None,
-                    "tp": None,
-                    "sl": None,
-                    "size": None,
-                    "symbol": None
-                }
+                state = default_state()
                 save_state(state)
                 info["status"] = "SHORT TP HIT"
                 return attach_state_snapshot(info, state)
@@ -342,14 +337,7 @@ def run_cycle(symbol, interval):
                     "pnl": pnl,
                     "result": "SL HIT"
                 })
-                state = {
-                    "position": None,
-                    "entry": None,
-                    "tp": None,
-                    "sl": None,
-                    "size": None,
-                    "symbol": None
-                }
+                state = default_state()
                 save_state(state)
                 info["status"] = "SHORT SL HIT"
                 return attach_state_snapshot(info, state)
@@ -358,10 +346,7 @@ def run_cycle(symbol, interval):
         return attach_state_snapshot(info, state)
 
     # ---------- NEW ENTRY ----------
-    if state.get("position"):
-        info["status"] = "Position already open"
-        return attach_state_snapshot(info, state)
-
+    # yahan tak aane ka matlab: exchange pe bhi koi position nahi, state bhi empty
     if macd_hist is None or atr14 is None or ema9 is None or ema21 is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
@@ -405,36 +390,52 @@ def run_cycle(symbol, interval):
 
     # ATR TP/SL
     if side == "buy":
-        sl = price - atr14
-        tp = price + atr14 * 2
         pos_side = "long"
     else:
-        sl = price + atr14
-        tp = price - atr14 * 2
         pos_side = "short"
 
     order = place_market_order(symbol, side, order_size)
     info["order"] = order
     info["decision"] = decision
 
-    if order.get("code") == "0":
-        state.update({
-            "position": pos_side,
-            "entry": price,
-            "tp": tp,
-            "sl": sl,
-            "size": order_size,
-            "symbol": symbol
-        })
-        save_state(state)
-        info["status"] = f"{pos_side} opened"
-    else:
+    if order.get("code") != "0":
         info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
+        return attach_state_snapshot(info, state)
 
+    # ENTRY LOCK FROM EXCHANGE
+    exch_after = get_open_position_double_check(symbol)
+    if exch_after == "MISMATCH" or not exch_after:
+        info["status"] = "ENTRY LOCK FAILED / SYNC ISSUE"
+        return attach_state_snapshot(info, state)
+
+    real_entry = exch_after["entry"]
+    real_size = exch_after["size"]
+
+    if atr14 is not None:
+        if pos_side == "long":
+            sl = real_entry - atr14
+            tp = real_entry + atr14 * 2
+        else:
+            sl = real_entry + atr14
+            tp = real_entry - atr14 * 2
+    else:
+        sl = None
+        tp = None
+
+    state.update({
+        "position": pos_side,
+        "entry": real_entry,
+        "tp": tp,
+        "sl": sl,
+        "size": real_size,
+        "symbol": symbol
+    })
+    save_state(state)
+    info["status"] = f"{pos_side} opened (entry locked)"
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — Strong Sync + Internal TP/SL")
+st.title("OKX Auto Bot — Double Sync + Entry Lock")
 
 symbol = st.selectbox(
     "Symbol",
@@ -458,7 +459,7 @@ state = load_state()
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Start Auto"):
-        set_leverage(symbol, 10)  # sab pair 10x
+        set_leverage(symbol, 10)
         st.session_state.run = True
 with col2:
     if st.button("Stop Auto"):
