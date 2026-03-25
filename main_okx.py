@@ -90,7 +90,7 @@ def close_position(symbol, side, size):
     opposite = "sell" if side == "long" else "buy"
     return place_market_order(symbol, opposite, size)
 
-# ---------- POSITION (FIXED) ----------
+# ---------- NET-MODE SAFE POSITION READER ----------
 def get_open_position_once(symbol):
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
@@ -101,16 +101,16 @@ def get_open_position_once(symbol):
         if p.get("instId") != symbol:
             continue
 
-        pos_str = p.get("pos", "0")
+        pos_raw = p.get("pos", "0")
+
         try:
-            pos_val = float(pos_str)
+            pos_val = float(pos_raw)
         except:
             pos_val = 0.0
 
         if pos_val == 0:
             continue
 
-        # ✅ direction pos ki sign se:
         side = "long" if pos_val > 0 else "short"
         entry = float(p.get("avgPx", 0))
         size = abs(pos_val)
@@ -120,15 +120,18 @@ def get_open_position_once(symbol):
             "entry": entry,
             "size": size
         }
+
     return None
 
+# ---------- HARD SYNC LOCK ----------
 def get_open_position_double_check(symbol):
     p1 = get_open_position_once(symbol)
     p2 = get_open_position_once(symbol)
 
-    if (p1 is None and p2 is None):
+    if p1 is None and p2 is None:
         return None
-    if (p1 is not None and p2 is not None and
+
+    if (p1 and p2 and
         p1["position"] == p2["position"] and
         abs(p1["entry"] - p2["entry"]) < 0.5 and
         abs(p1["size"] - p2["size"]) < 1e-6):
@@ -136,6 +139,7 @@ def get_open_position_double_check(symbol):
 
     return "MISMATCH"
 
+# ---------- BALANCE ----------
 def get_usdt_balance():
     path = "/api/v5/account/balance"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
@@ -146,6 +150,7 @@ def get_usdt_balance():
             return float(d["eq"])
     return None
 
+# ---------- LEVERAGE ----------
 def set_leverage(symbol, lever=10):
     path = "/api/v5/account/set-leverage"
     body = json.dumps({
@@ -215,6 +220,7 @@ def attach_state_snapshot(info, state):
 def run_cycle(symbol, interval):
     state = load_state()
 
+    # --- GET CANDLES ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return attach_state_snapshot({"error": data}, state)
@@ -243,25 +249,28 @@ def run_cycle(symbol, interval):
         "macd_hist": macd_hist
     }
 
-    # --- DOUBLE CHECK EXCHANGE POSITION ---
+    # ---------- HARD SYNC LOCK ----------
     exch_pos = get_open_position_double_check(symbol)
+
     if exch_pos == "MISMATCH":
-        info["status"] = "SYNC MISMATCH: blocking new trades"
+        info["status"] = "SYNC MISMATCH — blocking trades"
         return attach_state_snapshot(info, state)
 
+    # ---------- EXCHANGE-FIRST OVERRIDE ----------
     if exch_pos:
         state["position"] = exch_pos["position"]
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
 
-        if atr14 is not None and (state.get("tp") is None or state.get("sl") is None):
+        if atr14:
             if state["position"] == "long":
                 state["sl"] = state["entry"] - atr14
                 state["tp"] = state["entry"] + atr14 * 2
             else:
                 state["sl"] = state["entry"] + atr14
                 state["tp"] = state["entry"] - atr14 * 2
+
         save_state(state)
     else:
         state = default_state()
@@ -275,23 +284,11 @@ def run_cycle(symbol, interval):
         sl = state["sl"]
         size = state["size"]
 
-        if tp is None or sl is None:
-            info["status"] = f"{pos} open (TP/SL rebuilding...)"
-            return attach_state_snapshot(info, state)
-
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
                 pnl = (tp - entry) * size
-                save_trade({
-                    "time": datetime.utcnow(),
-                    "symbol": symbol,
-                    "side": "LONG",
-                    "entry": entry,
-                    "exit": tp,
-                    "pnl": pnl,
-                    "result": "TP HIT"
-                })
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
                 state = default_state()
                 save_state(state)
                 info["status"] = "LONG TP HIT"
@@ -300,15 +297,7 @@ def run_cycle(symbol, interval):
             if price <= sl:
                 close_position(symbol, pos, size)
                 pnl = (sl - entry) * size
-                save_trade({
-                    "time": datetime.utcnow(),
-                    "symbol": symbol,
-                    "side": "LONG",
-                    "entry": entry,
-                    "exit": sl,
-                    "pnl": pnl,
-                    "result": "SL HIT"
-                })
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
                 state = default_state()
                 save_state(state)
                 info["status"] = "LONG SL HIT"
@@ -318,15 +307,7 @@ def run_cycle(symbol, interval):
             if price <= tp:
                 close_position(symbol, pos, size)
                 pnl = (entry - tp) * size
-                save_trade({
-                    "time": datetime.utcnow(),
-                    "symbol": symbol,
-                    "side": "SHORT",
-                    "entry": entry,
-                    "exit": tp,
-                    "pnl": pnl,
-                    "result": "TP HIT"
-                })
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
                 state = default_state()
                 save_state(state)
                 info["status"] = "SHORT TP HIT"
@@ -335,15 +316,7 @@ def run_cycle(symbol, interval):
             if price >= sl:
                 close_position(symbol, pos, size)
                 pnl = (entry - sl) * size
-                save_trade({
-                    "time": datetime.utcnow(),
-                    "symbol": symbol,
-                    "side": "SHORT",
-                    "entry": entry,
-                    "exit": sl,
-                    "pnl": pnl,
-                    "result": "SL HIT"
-                })
+                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
                 state = default_state()
                 save_state(state)
                 info["status"] = "SHORT SL HIT"
@@ -352,7 +325,7 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY ----------
+    # ---------- NEW ENTRY (ONLY IF EXCHANGE EMPTY) ----------
     if macd_hist is None or atr14 is None or ema9 is None or ema21 is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
@@ -389,19 +362,12 @@ def run_cycle(symbol, interval):
     lot = get_lot_size(symbol)
     steps = math.floor(raw_size / lot)
     if steps <= 0:
-        info["status"] = "Order size too small (lot adjust)"
+        info["status"] = "Order size too small"
         return attach_state_snapshot(info, state)
 
     order_size = steps * lot
 
-    if order_size <= 0:
-        info["status"] = "Order size too small"
-        return attach_state_snapshot(info, state)
-
-    if side == "buy":
-        pos_side = "long"
-    else:
-        pos_side = "short"
+    pos_side = "long" if side == "buy" else "short"
 
     order = place_market_order(symbol, side, order_size)
     info["order"] = order
@@ -413,22 +379,18 @@ def run_cycle(symbol, interval):
 
     exch_after = get_open_position_double_check(symbol)
     if exch_after == "MISMATCH" or not exch_after:
-        info["status"] = "ENTRY LOCK FAILED / SYNC ISSUE"
+        info["status"] = "ENTRY LOCK FAILED"
         return attach_state_snapshot(info, state)
 
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
-    if atr14 is not None:
-        if pos_side == "long":
-            sl = real_entry - atr14
-            tp = real_entry + atr14 * 2
-        else:
-            sl = real_entry + atr14
-            tp = real_entry - atr14 * 2
+    if pos_side == "long":
+        sl = real_entry - atr14
+        tp = real_entry + atr14 * 2
     else:
-        sl = None
-        tp = None
+        sl = real_entry + atr14
+        tp = real_entry - atr14 * 2
 
     state.update({
         "position": pos_side,
@@ -443,17 +405,11 @@ def run_cycle(symbol, interval):
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — Double Sync + Entry Lock")
+st.title("OKX Auto Bot — NET-MODE SAFE VERSION")
 
 symbol = st.selectbox(
     "Symbol",
-    [
-        "BTC-USDT-SWAP",
-        "ETH-USDT-SWAP",
-        "SOL-USDT-SWAP",
-        "AAVE-USDT-SWAP",
-        "XRP-USDT-SWAP"
-    ]
+    ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "AAVE-USDT-SWAP", "XRP-USDT-SWAP"]
 )
 interval = st.selectbox("Interval", ["1m", "5m", "15m"])
 
