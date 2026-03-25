@@ -5,6 +5,7 @@ import json
 import streamlit as st
 import pandas as pd
 import os
+import math
 from datetime import datetime
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
@@ -111,7 +112,6 @@ def get_open_position_double_check(symbol):
     p1 = get_open_position_once(symbol)
     p2 = get_open_position_once(symbol)
 
-    # dono calls same honi chahiye, warna unsafe
     if (p1 is None and p2 is None):
         return None
     if (p1 is not None and p2 is not None and
@@ -120,7 +120,6 @@ def get_open_position_double_check(symbol):
         abs(p1["size"] - p2["size"]) < 1e-6):
         return p1
 
-    # mismatch → unsafe, bot trade nahi karega
     return "MISMATCH"
 
 def get_usdt_balance():
@@ -202,7 +201,6 @@ def attach_state_snapshot(info, state):
 def run_cycle(symbol, interval):
     state = load_state()
 
-    # --- GET DATA FIRST ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return attach_state_snapshot({"error": data}, state)
@@ -238,13 +236,11 @@ def run_cycle(symbol, interval):
         return attach_state_snapshot(info, state)
 
     if exch_pos:
-        # exchange pe jo hai, wahi sach hai
         state["position"] = exch_pos["position"]
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
 
-        # TP/SL auto rebuild if missing
         if atr14 is not None and (state.get("tp") is None or state.get("sl") is None):
             if state["position"] == "long":
                 state["sl"] = state["entry"] - atr14
@@ -254,7 +250,6 @@ def run_cycle(symbol, interval):
                 state["tp"] = state["entry"] - atr14 * 2
         save_state(state)
     else:
-        # exchange pe koi position nahi → state clear
         state = default_state()
         save_state(state)
 
@@ -270,7 +265,6 @@ def run_cycle(symbol, interval):
             info["status"] = f"{pos} open (TP/SL rebuilding...)"
             return attach_state_snapshot(info, state)
 
-        # LONG CLOSE
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
@@ -306,7 +300,6 @@ def run_cycle(symbol, interval):
                 info["status"] = "LONG SL HIT"
                 return attach_state_snapshot(info, state)
 
-        # SHORT CLOSE
         if pos == "short":
             if price <= tp:
                 close_position(symbol, pos, size)
@@ -346,7 +339,6 @@ def run_cycle(symbol, interval):
         return attach_state_snapshot(info, state)
 
     # ---------- NEW ENTRY ----------
-    # yahan tak aane ka matlab: exchange pe bhi koi position nahi, state bhi empty
     if macd_hist is None or atr14 is None or ema9 is None or ema21 is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
@@ -381,14 +373,17 @@ def run_cycle(symbol, interval):
     raw_size = exposure / price
 
     lot = get_lot_size(symbol)
-    steps = round(raw_size / lot)
+    steps = math.floor(raw_size / lot)
+    if steps <= 0:
+        info["status"] = "Order size too small (lot adjust)"
+        return attach_state_snapshot(info, state)
+
     order_size = steps * lot
 
     if order_size <= 0:
         info["status"] = "Order size too small"
         return attach_state_snapshot(info, state)
 
-    # ATR TP/SL
     if side == "buy":
         pos_side = "long"
     else:
@@ -402,7 +397,6 @@ def run_cycle(symbol, interval):
         info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
         return attach_state_snapshot(info, state)
 
-    # ENTRY LOCK FROM EXCHANGE
     exch_after = get_open_position_double_check(symbol)
     if exch_after == "MISMATCH" or not exch_after:
         info["status"] = "ENTRY LOCK FAILED / SYNC ISSUE"
