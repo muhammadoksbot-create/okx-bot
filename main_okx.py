@@ -90,6 +90,7 @@ def close_position(symbol, side, size):
     opposite = "sell" if side == "long" else "buy"
     return place_market_order(symbol, opposite, size)
 
+# ---------- POSITION (FIXED) ----------
 def get_open_position_once(symbol):
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
@@ -97,15 +98,28 @@ def get_open_position_once(symbol):
         return None
 
     for p in r.get("data", []):
-        if p.get("instId") == symbol and float(p.get("pos", 0)) != 0:
-            side = "long" if p.get("posSide") == "long" else "short"
-            entry = float(p.get("avgPx", 0))
-            size = abs(float(p.get("pos", 0)))
-            return {
-                "position": side,
-                "entry": entry,
-                "size": size
-            }
+        if p.get("instId") != symbol:
+            continue
+
+        pos_str = p.get("pos", "0")
+        try:
+            pos_val = float(pos_str)
+        except:
+            pos_val = 0.0
+
+        if pos_val == 0:
+            continue
+
+        # ✅ direction pos ki sign se:
+        side = "long" if pos_val > 0 else "short"
+        entry = float(p.get("avgPx", 0))
+        size = abs(pos_val)
+
+        return {
+            "position": side,
+            "entry": entry,
+            "size": size
+        }
     return None
 
 def get_open_position_double_check(symbol):
