@@ -68,12 +68,16 @@ def get_candles(symbol, interval, limit=200):
     path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
     return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
 
-def get_mark_price(symbol):
+def get_ticker(symbol):
     path = f"/api/v5/market/ticker?instId={symbol}"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") == "0" and r.get("data"):
-        return float(r["data"][0]["last"])
-    return None
+        d = r["data"][0]
+        last = float(d["last"])
+        # OKX API has separate mark price field, but for demo we fallback to last if missing
+        mark = float(d.get("last", last))
+        return {"last": last, "mark": mark}
+    return {"last": None, "mark": None}
 
 def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
@@ -170,36 +174,17 @@ def ema(values, period):
         e = v * k + e * (1 - k)
     return e
 
-def atr(highs, lows, closes, period=14):
-    if len(highs) < period + 1:
+def vwap(closes, volumes):
+    if not closes or not volumes or len(closes) != len(volumes):
         return None
-    trs = []
-    for i in range(1, period + 1):
-        high, low, prev_close = highs[i], lows[i], closes[i - 1]
-        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return sum(trs) / period
-
-def macd(values, fast=12, slow=26, signal=9):
-    if len(values) < slow + signal:
-        return None, None, None
-
-    def ema_series(vals, period):
-        k = 2 / (period + 1)
-        e = vals[0]
-        out = [e]
-        for v in vals[1:]:
-            e = v * k + e * (1 - k)
-            out.append(e)
-        return out
-
-    fast_ema = ema_series(values, fast)
-    slow_ema = ema_series(values, slow)
-    fast_ema = fast_ema[-len(slow_ema):]
-    macd_line_series = [f - s for f, s in zip(fast_ema, slow_ema)]
-    signal_line_series = ema_series(macd_line_series, signal)
-    hist_series = [m - s for m, s in zip(macd_line_series[-len(signal_line_series):], signal_line_series)]
-
-    return macd_line_series[-1], signal_line_series[-1], hist_series[-1]
+    num = 0.0
+    den = 0.0
+    for c, v in zip(closes, volumes):
+        num += c * v
+        den += v
+    if den == 0:
+        return None
+    return num / den
 
 # ---------- CSV SAVE ----------
 def save_trade(data):
@@ -229,24 +214,22 @@ def run_cycle(symbol, interval):
     closes = [float(c[4]) for c in candles]
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
+    vols   = [float(c[5]) for c in candles]  # volume
 
-    ema9  = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    atr14 = atr(highs, lows, closes, 14)
-    macd_line, macd_signal, macd_hist = macd(closes)
+    ema50 = ema(closes, 50)
+    vwap_val = vwap(closes, vols)
 
-    price = get_mark_price(symbol)
-    if price is None:
-        price = closes[-1]
+    ticker = get_ticker(symbol)
+    chart_price = ticker["last"]
+    mark_price = ticker["mark"]
+
+    price = mark_price if mark_price is not None else closes[-1]
 
     info = {
-        "price": price,
-        "ema9": ema9,
-        "ema21": ema21,
-        "atr14": atr14,
-        "macd": macd_line,
-        "macd_signal": macd_signal,
-        "macd_hist": macd_hist
+        "chart_price": chart_price,
+        "mark_price": mark_price,
+        "ema50": ema50,
+        "vwap": vwap_val
     }
 
     # ---------- HARD SYNC LOCK ----------
@@ -262,15 +245,6 @@ def run_cycle(symbol, interval):
         state["entry"] = exch_pos["entry"]
         state["size"] = exch_pos["size"]
         state["symbol"] = symbol
-
-        if atr14:
-            if state["position"] == "long":
-                state["sl"] = state["entry"] - atr14
-                state["tp"] = state["entry"] + atr14 * 2
-            else:
-                state["sl"] = state["entry"] + atr14
-                state["tp"] = state["entry"] - atr14 * 2
-
         save_state(state)
     else:
         state = default_state()
@@ -284,11 +258,23 @@ def run_cycle(symbol, interval):
         sl = state["sl"]
         size = state["size"]
 
+        if tp is None or sl is None:
+            info["status"] = f"{pos} open (TP/SL missing)"
+            return attach_state_snapshot(info, state)
+
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
                 pnl = (tp - entry) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "entry": entry,
+                    "exit": tp,
+                    "pnl": pnl,
+                    "result": "TP HIT"
+                })
                 state = default_state()
                 save_state(state)
                 info["status"] = "LONG TP HIT"
@@ -297,7 +283,15 @@ def run_cycle(symbol, interval):
             if price <= sl:
                 close_position(symbol, pos, size)
                 pnl = (sl - entry) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "LONG", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "entry": entry,
+                    "exit": sl,
+                    "pnl": pnl,
+                    "result": "SL HIT"
+                })
                 state = default_state()
                 save_state(state)
                 info["status"] = "LONG SL HIT"
@@ -307,7 +301,15 @@ def run_cycle(symbol, interval):
             if price <= tp:
                 close_position(symbol, pos, size)
                 pnl = (entry - tp) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": tp, "pnl": pnl, "result": "TP HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "SHORT",
+                    "entry": entry,
+                    "exit": tp,
+                    "pnl": pnl,
+                    "result": "TP HIT"
+                })
                 state = default_state()
                 save_state(state)
                 info["status"] = "SHORT TP HIT"
@@ -316,7 +318,15 @@ def run_cycle(symbol, interval):
             if price >= sl:
                 close_position(symbol, pos, size)
                 pnl = (entry - sl) * size
-                save_trade({"time": datetime.utcnow(), "symbol": symbol, "side": "SHORT", "entry": entry, "exit": sl, "pnl": pnl, "result": "SL HIT"})
+                save_trade({
+                    "time": datetime.utcnow(),
+                    "symbol": symbol,
+                    "side": "SHORT",
+                    "entry": entry,
+                    "exit": sl,
+                    "pnl": pnl,
+                    "result": "SL HIT"
+                })
                 state = default_state()
                 save_state(state)
                 info["status"] = "SHORT SL HIT"
@@ -325,29 +335,29 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (ONLY IF EXCHANGE EMPTY) ----------
-    if macd_hist is None or atr14 is None or ema9 is None or ema21 is None:
+    # ---------- NEW ENTRY (VWAP SCALPING) ----------
+    if ema50 is None or vwap_val is None or chart_price is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
 
-    up = ema9 > ema21
-    down = ema9 < ema21
-
-    recent_high = max(highs[-8:])
-    recent_low  = min(lows[-8:])
+    up_trend = chart_price > ema50
+    down_trend = chart_price < ema50
 
     side = None
     decision = None
 
-    if up and macd_hist > -1 and price > recent_high * 0.998:
+    # LONG: price above EMA50 and above/near VWAP
+    if up_trend and chart_price >= vwap_val:
         side = "buy"
-        decision = "BUY"
-    elif down and macd_hist < 1 and price < recent_low * 1.002:
+        decision = "LONG_VWAP"
+
+    # SHORT: price below EMA50 and below/near VWAP
+    elif down_trend and chart_price <= vwap_val:
         side = "sell"
-        decision = "SELL"
+        decision = "SHORT_VWAP"
 
     if not side:
-        info["status"] = "No signal"
+        info["status"] = "No signal (VWAP)"
         return attach_state_snapshot(info, state)
 
     balance = get_usdt_balance()
@@ -385,12 +395,16 @@ def run_cycle(symbol, interval):
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
+    # --- SCALPING TP/SL (fixed %) ---
+    SL_PCT = 0.003   # 0.3%
+    TP_PCT = 0.007   # 0.7%
+
     if pos_side == "long":
-        sl = real_entry - atr14
-        tp = real_entry + atr14 * 2
+        sl = real_entry * (1 - SL_PCT)
+        tp = real_entry * (1 + TP_PCT)
     else:
-        sl = real_entry + atr14
-        tp = real_entry - atr14 * 2
+        sl = real_entry * (1 + SL_PCT)
+        tp = real_entry * (1 - TP_PCT)
 
     state.update({
         "position": pos_side,
@@ -401,11 +415,13 @@ def run_cycle(symbol, interval):
         "symbol": symbol
     })
     save_state(state)
-    info["status"] = f"{pos_side} opened (entry locked)"
+    info["status"] = f"{pos_side} opened (VWAP scalping)"
+    info["tp_pct"] = TP_PCT * 100
+    info["sl_pct"] = SL_PCT * 100
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — NET-MODE SAFE VERSION")
+st.title("OKX Auto Bot — VWAP Scalping + Strong Sync")
 
 symbol = st.selectbox(
     "Symbol",
