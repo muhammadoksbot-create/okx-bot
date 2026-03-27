@@ -74,7 +74,6 @@ def get_ticker(symbol):
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
         last = float(d["last"])
-        # OKX API has separate mark price field, but for demo we fallback to last if missing
         mark = float(d.get("last", last))
         return {"last": last, "mark": mark}
     return {"last": None, "mark": None}
@@ -174,17 +173,16 @@ def ema(values, period):
         e = v * k + e * (1 - k)
     return e
 
-def vwap(closes, volumes):
-    if not closes or not volumes or len(closes) != len(volumes):
-        return None
-    num = 0.0
-    den = 0.0
-    for c, v in zip(closes, volumes):
-        num += c * v
-        den += v
-    if den == 0:
-        return None
-    return num / den
+def ema_series(values, period):
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = []
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
 
 # ---------- CSV SAVE ----------
 def save_trade(data):
@@ -201,7 +199,7 @@ def attach_state_snapshot(info, state):
     info["symbol"] = state.get("symbol")
     return info
 
-# ---------- RUN CYCLE ----------
+# ---------- CORE CYCLE (EMA 9/21 PULLBACK) ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
@@ -214,22 +212,27 @@ def run_cycle(symbol, interval):
     closes = [float(c[4]) for c in candles]
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
-    vols   = [float(c[5]) for c in candles]  # volume
 
-    ema50 = ema(closes, 50)
-    vwap_val = vwap(closes, vols)
+    if len(closes) < 30:
+        info = {"status": "Not enough candles"}
+        return attach_state_snapshot(info, state)
+
+    ema9_series  = ema_series(closes, 9)
+    ema21_series = ema_series(closes, 21)
+
+    ema9  = ema9_series[-1] if ema9_series else None
+    ema21 = ema21_series[-1] if ema21_series else None
 
     ticker = get_ticker(symbol)
     chart_price = ticker["last"]
     mark_price = ticker["mark"]
-
     price = mark_price if mark_price is not None else closes[-1]
 
     info = {
         "chart_price": chart_price,
         "mark_price": mark_price,
-        "ema50": ema50,
-        "vwap": vwap_val
+        "ema9": ema9,
+        "ema21": ema21,
     }
 
     # ---------- HARD SYNC LOCK ----------
@@ -335,29 +338,37 @@ def run_cycle(symbol, interval):
         info["status"] = f"{pos} open"
         return attach_state_snapshot(info, state)
 
-    # ---------- NEW ENTRY (VWAP SCALPING) ----------
-    if ema50 is None or vwap_val is None or chart_price is None:
+    # ---------- NEW ENTRY (EMA 9/21 PULLBACK) ----------
+    if ema9 is None or ema21 is None or chart_price is None:
         info["status"] = "Indicators not ready"
         return attach_state_snapshot(info, state)
 
-    up_trend = chart_price > ema50
-    down_trend = chart_price < ema50
+    last_close = closes[-1]
+    prev_close = closes[-2]
+    last_ema9  = ema9_series[-1]
+    prev_ema9  = ema9_series[-2]
 
     side = None
     decision = None
 
-    # LONG: price above EMA50 and above/near VWAP
-    if up_trend and chart_price >= vwap_val:
+    # LONG:
+    # 1) Trend up: EMA9 > EMA21
+    # 2) Previous close EMA9 ke neeche (pullback)
+    # 3) Last close EMA9 ke upar (reclaim)
+    if ema9 > ema21 and prev_close < prev_ema9 and last_close > last_ema9:
         side = "buy"
-        decision = "LONG_VWAP"
+        decision = "LONG_EMA_PULLBACK"
 
-    # SHORT: price below EMA50 and below/near VWAP
-    elif down_trend and chart_price <= vwap_val:
+    # SHORT:
+    # 1) Trend down: EMA9 < EMA21
+    # 2) Previous close EMA9 ke upar (pullback)
+    # 3) Last close EMA9 ke neeche (reclaim)
+    elif ema9 < ema21 and prev_close > prev_ema9 and last_close < last_ema9:
         side = "sell"
-        decision = "SHORT_VWAP"
+        decision = "SHORT_EMA_PULLBACK"
 
     if not side:
-        info["status"] = "No signal (VWAP)"
+        info["status"] = "No signal (EMA pullback)"
         return attach_state_snapshot(info, state)
 
     balance = get_usdt_balance()
@@ -376,7 +387,6 @@ def run_cycle(symbol, interval):
         return attach_state_snapshot(info, state)
 
     order_size = steps * lot
-
     pos_side = "long" if side == "buy" else "short"
 
     order = place_market_order(symbol, side, order_size)
@@ -395,9 +405,9 @@ def run_cycle(symbol, interval):
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
-    # --- SCALPING TP/SL (fixed %) ---
+    # --- SCALPING TP/SL (tweakable) ---
     SL_PCT = 0.003   # 0.3%
-    TP_PCT = 0.007   # 0.7%
+    TP_PCT = 0.003   # 0.3% (1:1 RR to start)
 
     if pos_side == "long":
         sl = real_entry * (1 - SL_PCT)
@@ -415,13 +425,13 @@ def run_cycle(symbol, interval):
         "symbol": symbol
     })
     save_state(state)
-    info["status"] = f"{pos_side} opened (VWAP scalping)"
+    info["status"] = f"{pos_side} opened (EMA pullback)"
     info["tp_pct"] = TP_PCT * 100
     info["sl_pct"] = SL_PCT * 100
     return attach_state_snapshot(info, state)
 
 # ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — VWAP Scalping + Strong Sync")
+st.title("OKX Auto Bot — EMA 9/21 Pullback + Strong Sync")
 
 symbol = st.selectbox(
     "Symbol",
