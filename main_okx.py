@@ -2,16 +2,22 @@ import requests
 import hmac
 import base64
 import json
-import streamlit as st
 import pandas as pd
 import os
 import math
+import time
 from datetime import datetime
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
 BASE_URL = "https://www.okx.com"
 CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
+
+# FIXED SETTINGS
+SYMBOL = "DOGE-USDT-SWAP"   # fixed pair
+INTERVAL = "15m"            # fixed timeframe
+LEVERAGE = 10               # 10x
+RISK_PER_TRADE = 10.0       # 10 USDT per trade (max loss)
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -31,7 +37,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "X-SIMULATED-TRADING": "1"
+        "X-SIMULATED-TRADING": "1"  # DEMO MODE
     }
 
 # ---------- STATE ----------
@@ -270,7 +276,7 @@ def run_cycle(symbol, interval):
                 close_position(symbol, pos, size)
                 pnl = (tp - entry) * size
                 save_trade({
-                    "time": datetime.utcnow(),
+                    "time": datetime.utcnow().isoformat(),
                     "symbol": symbol,
                     "side": "LONG",
                     "entry": entry,
@@ -287,7 +293,7 @@ def run_cycle(symbol, interval):
                 close_position(symbol, pos, size)
                 pnl = (sl - entry) * size
                 save_trade({
-                    "time": datetime.utcnow(),
+                    "time": datetime.utcnow().isoformat(),
                     "symbol": symbol,
                     "side": "LONG",
                     "entry": entry,
@@ -305,7 +311,7 @@ def run_cycle(symbol, interval):
                 close_position(symbol, pos, size)
                 pnl = (entry - tp) * size
                 save_trade({
-                    "time": datetime.utcnow(),
+                    "time": datetime.utcnow().isoformat(),
                     "symbol": symbol,
                     "side": "SHORT",
                     "entry": entry,
@@ -322,7 +328,7 @@ def run_cycle(symbol, interval):
                 close_position(symbol, pos, size)
                 pnl = (entry - sl) * size
                 save_trade({
-                    "time": datetime.utcnow(),
+                    "time": datetime.utcnow().isoformat(),
                     "symbol": symbol,
                     "side": "SHORT",
                     "entry": entry,
@@ -352,17 +358,11 @@ def run_cycle(symbol, interval):
     decision = None
 
     # LONG:
-    # 1) Trend up: EMA9 > EMA21
-    # 2) Previous close EMA9 ke neeche (pullback)
-    # 3) Last close EMA9 ke upar (reclaim)
     if ema9 > ema21 and prev_close < prev_ema9 and last_close > last_ema9:
         side = "buy"
         decision = "LONG_EMA_PULLBACK"
 
     # SHORT:
-    # 1) Trend down: EMA9 < EMA21
-    # 2) Previous close EMA9 ke upar (pullback)
-    # 3) Last close EMA9 ke neeche (reclaim)
     elif ema9 < ema21 and prev_close > prev_ema9 and last_close < last_ema9:
         side = "sell"
         decision = "SHORT_EMA_PULLBACK"
@@ -376,8 +376,9 @@ def run_cycle(symbol, interval):
         info["status"] = "Balance error"
         return attach_state_snapshot(info, state)
 
-    risk = balance * 0.10
-    exposure = risk * 10
+    # ---- FIXED RISK: 10 USDT PER TRADE + 10x LEVERAGE ----
+    risk = RISK_PER_TRADE
+    exposure = risk * LEVERAGE
     raw_size = exposure / price
 
     lot = get_lot_size(symbol)
@@ -405,9 +406,9 @@ def run_cycle(symbol, interval):
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
-    # --- SCALPING TP/SL (tweakable) ---
-    SL_PCT = 0.003   # 0.3%
-    TP_PCT = 0.003   # 0.3% (1:1 RR to start)
+    # --- TP/SL (abhi 0.3% / 0.3% hi rakha hai, baad me 1:2 kar sakte hain) ---
+    SL_PCT = 0.003
+    TP_PCT = 0.003
 
     if pos_side == "long":
         sl = real_entry * (1 - SL_PCT)
@@ -430,50 +431,20 @@ def run_cycle(symbol, interval):
     info["sl_pct"] = SL_PCT * 100
     return attach_state_snapshot(info, state)
 
-# ---------- STREAMLIT UI ----------
-st.title("OKX Auto Bot — EMA 9/21 Pullback + Strong Sync")
+# ---------- SIMPLE MAIN LOOP (BACKEND) ----------
+def main():
+    # set leverage once
+    set_leverage(SYMBOL, LEVERAGE)
+    print(f"Bot started on {SYMBOL}, interval={INTERVAL}, lev={LEVERAGE}x, risk={RISK_PER_TRADE} USDT")
 
-symbol = st.selectbox(
-    "Symbol",
-    ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "AAVE-USDT-SWAP", "XRP-USDT-SWAP"]
-)
-interval = st.selectbox("Interval", ["1m", "5m", "15m"])
+    while True:
+        try:
+            info = run_cycle(SYMBOL, INTERVAL)
+            print(datetime.utcnow().isoformat(), info)
+        except Exception as e:
+            print("ERROR in cycle:", e)
+        # 15m candle ke liye approx 60–90 sec me ek cycle theek hai demo testing ke liye
+        time.sleep(60)
 
-if "run" not in st.session_state:
-    st.session_state.run = False
-if "cycle" not in st.session_state:
-    st.session_state.cycle = 0
-
-state = load_state()
-
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("Start Auto"):
-        set_leverage(symbol, 10)
-        st.session_state.run = True
-with col2:
-    if st.button("Stop Auto"):
-        st.session_state.run = False
-
-st.write("Status:", "RUNNING" if st.session_state.run else "STOPPED")
-st.write("Position:", state.get("position"))
-st.write("Entry:", state.get("entry"))
-st.write("TP:", state.get("tp"))
-st.write("SL:", state.get("sl"))
-st.write("Size:", state.get("size"))
-st.write("Symbol (state):", state.get("symbol"))
-
-st.subheader("Manual Cycle")
-if st.button("Run One Cycle"):
-    st.json(run_cycle(symbol, interval))
-
-st.subheader("Auto Cycles")
-auto_cycles = st.number_input("Cycles per click", 1, 50, 5)
-
-if st.session_state.run:
-    if st.button("Run Auto Batch"):
-        for _ in range(int(auto_cycles)):
-            st.session_state.cycle += 1
-            st.json(run_cycle(symbol, interval))
-else:
-    st.info("Auto stopped.")
+if __name__ == "__main__":
+    main()
