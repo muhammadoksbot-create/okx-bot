@@ -31,14 +31,18 @@ def get_headers(method, path, body=""):
     message = timestamp + method + path + body
     signature = sign(message, SECRET_KEY)
 
-    return {
+    headers = {
         "OK-ACCESS-KEY": API_KEY,
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "X-SIMULATED-TRADING": "1"  # DEMO MODE
     }
+
+    # DEMO / PAPER TRADING FLAG
+    headers["x-simulated-trading"] = "1"
+
+    return headers
 
 # ---------- STATE ----------
 def default_state():
@@ -80,7 +84,7 @@ def get_ticker(symbol):
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
         last = float(d["last"])
-        mark = float(d.get("last", last))
+        mark = float(d.get("markPx", last))
         return {"last": last, "mark": mark}
     return {"last": None, "mark": None}
 
@@ -93,7 +97,15 @@ def place_market_order(symbol, side, size):
         "ordType": "market",
         "sz": str(size)
     })
-    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
+    try:
+        r = requests.post(
+            BASE_URL + path,
+            headers=get_headers("POST", path, body),
+            data=body
+        ).json()
+    except Exception as e:
+        return {"code": "-1", "msg": f"REQUEST ERROR: {e}"}
+    return r
 
 def close_position(symbol, side, size):
     opposite = "sell" if side == "long" else "buy"
@@ -154,9 +166,12 @@ def get_usdt_balance():
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") != "0":
         return None
-    for d in r["data"][0]["details"]:
+    details = r["data"][0].get("details", [])
+    for d in details:
         if d["ccy"] == "USDT":
-            return float(d["eq"])
+            # availBal = free margin, eq = total equity
+            avail = float(d.get("availBal", d.get("eq", 0)))
+            return avail
     return None
 
 # ---------- LEVERAGE ----------
@@ -212,7 +227,8 @@ def run_cycle(symbol, interval):
     # --- GET CANDLES ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
-        return attach_state_snapshot({"error": data}, state)
+        info = {"status": "Candle error", "error": data}
+        return attach_state_snapshot(info, state)
 
     candles = list(reversed(data["data"]))
     closes = [float(c[4]) for c in candles]
@@ -223,11 +239,11 @@ def run_cycle(symbol, interval):
         info = {"status": "Not enough candles"}
         return attach_state_snapshot(info, state)
 
-    ema9_series  = ema_series(closes, 9)
-    ema21_series = ema_series(closes, 21)
+    ema9_series_vals  = ema_series(closes, 9)
+    ema21_series_vals = ema_series(closes, 21)
 
-    ema9  = ema9_series[-1] if ema9_series else None
-    ema21 = ema21_series[-1] if ema21_series else None
+    ema9  = ema9_series_vals[-1] if ema9_series_vals else None
+    ema21 = ema21_series_vals[-1] if ema21_series_vals else None
 
     ticker = get_ticker(symbol)
     chart_price = ticker["last"]
@@ -351,8 +367,8 @@ def run_cycle(symbol, interval):
 
     last_close = closes[-1]
     prev_close = closes[-2]
-    last_ema9  = ema9_series[-1]
-    prev_ema9  = ema9_series[-2]
+    last_ema9  = ema9_series_vals[-1]
+    prev_ema9  = ema9_series_vals[-2]
 
     side = None
     decision = None
@@ -376,8 +392,13 @@ def run_cycle(symbol, interval):
         info["status"] = "Balance error"
         return attach_state_snapshot(info, state)
 
+    # ---- SAFETY: agar balance bohot kam ho to skip ----
+    if balance < RISK_PER_TRADE * 1.2:
+        info["status"] = f"Balance too low for risk={RISK_PER_TRADE}, avail={balance}"
+        return attach_state_snapshot(info, state)
+
     # ---- FIXED RISK: 10 USDT PER TRADE + 10x LEVERAGE ----
-    risk = RISK_PER_TRADE
+    risk = min(RISK_PER_TRADE, balance * 0.9)
     exposure = risk * LEVERAGE
     raw_size = exposure / price
 
@@ -393,9 +414,21 @@ def run_cycle(symbol, interval):
     order = place_market_order(symbol, side, order_size)
     info["order"] = order
     info["decision"] = decision
+    info["order_size"] = order_size
+    info["balance"] = balance
 
     if order.get("code") != "0":
-        info["status"] = f"ORDER FAILED: {order.get('msg', 'unknown error')}"
+        msg = order.get("msg", "unknown error")
+        # 51008 = margin/balance issue
+        if order.get("code") == "1":
+            # sCode inside data
+            try:
+                sCode = order["data"][0].get("sCode")
+                sMsg = order["data"][0].get("sMsg")
+                msg = f"{msg} | sCode={sCode}, sMsg={sMsg}"
+            except:
+                pass
+        info["status"] = f"ORDER FAILED: {msg}"
         return attach_state_snapshot(info, state)
 
     exch_after = get_open_position_double_check(symbol)
@@ -406,7 +439,7 @@ def run_cycle(symbol, interval):
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
-    # --- TP/SL (abhi 0.3% / 0.3% hi rakha hai, baad me 1:2 kar sakte hain) ---
+    # --- TP/SL (abhi 0.3% / 0.3%) ---
     SL_PCT = 0.003
     TP_PCT = 0.003
 
@@ -433,7 +466,6 @@ def run_cycle(symbol, interval):
 
 # ---------- SIMPLE MAIN LOOP (BACKEND) ----------
 def main():
-    # set leverage once
     set_leverage(SYMBOL, LEVERAGE)
     print(f"Bot started on {SYMBOL}, interval={INTERVAL}, lev={LEVERAGE}x, risk={RISK_PER_TRADE} USDT")
 
@@ -443,7 +475,6 @@ def main():
             print(datetime.utcnow().isoformat(), info)
         except Exception as e:
             print("ERROR in cycle:", e)
-        # 15m candle ke liye approx 60–90 sec me ek cycle theek hai demo testing ke liye
         time.sleep(60)
 
 if __name__ == "__main__":
