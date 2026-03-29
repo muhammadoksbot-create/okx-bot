@@ -14,9 +14,11 @@ CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
 
 SYMBOL = "DOGE-USDT-SWAP"
-INTERVAL = "5m"
-LEVERAGE = 10          # 10x leverage
-RISK_PCT = 0.10        # wallet ka 10%
+INTERVAL = "5m"       # candle timeframe
+LEVERAGE = 10         # 10x leverage
+RISK_PCT = 0.10       # wallet ka 10%
+
+MAX_ORDER_SIZE = 200000  # safety cap (e.g. 200k DOGE)
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -36,7 +38,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"   # DEMO MODE
+        "x-simulated-trading": "1"   # DEMO MODE; LIVE me is line ko hata dena
     }
 
 # ---------- STATE ----------
@@ -89,7 +91,7 @@ def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
     body = json.dumps({
         "instId": symbol,
-        "tdMode": "cross",   # DEMO + cross margin
+        "tdMode": "cross",   # cross margin
         "side": side,
         "ordType": "market",
         "sz": str(size)
@@ -188,7 +190,7 @@ def ema_series(values, period):
 # ---------- CSV ----------
 def save_trade(data):
     df = pd.DataFrame([data])
-    df.to_csv(CSV_FILE, mode="a", header=not os.path_exists(CSV_FILE), index=False)
+    df.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
 
 # ---------- SNAPSHOT ----------
 def attach_state_snapshot(info, state):
@@ -285,7 +287,7 @@ def run_cycle(symbol, interval):
 
         return attach_state_snapshot({"status": f"{pos} open"}, state)
 
-    # --- SIMPLE TREND ENTRY (NO PULLBACK) ---
+    # --- SIMPLE TREND ENTRY (EMA) ---
     side = None
     decision = None
 
@@ -310,9 +312,12 @@ def run_cycle(symbol, interval):
 
     lot = get_lot_size(symbol)
 
-    # LOT FIX: minimum 1 lot, and multiple of lot size
+    # LOT FIX + MIN 1 LOT
     steps = max(1, math.floor(raw_size / lot))
     order_size = steps * lot
+
+    # MAX CAP
+    order_size = min(order_size, MAX_ORDER_SIZE)
 
     if order_size <= 0:
         return attach_state_snapshot({"status": "Order size too small"}, state)
@@ -370,7 +375,7 @@ def main():
         except Exception as e:
             print("ERROR:", e)
 
-        time.sleep(60)
+        time.sleep(60)   # 1-minute cycle
 
 if __name__ == "__main__":
     main()
