@@ -17,7 +17,6 @@ SYMBOL = "DOGE-USDT-SWAP"
 INTERVAL = "5m"
 LEVERAGE = 10
 RISK_PCT = 0.10
-MAX_ORDER_SIZE = 200000  # OKX max limit safety
 
 def sign(message, secret_key):
     return base64.b64encode(
@@ -51,12 +50,15 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-def get_lot_size(symbol):
+def get_instrument_limits(symbol):
     path = f"/api/v5/public/instruments?instType=SWAP&instId={symbol}"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") == "0" and r.get("data"):
-        return float(r["data"][0]["lotSz"])
-    return 1.0
+        d = r["data"][0]
+        lot = float(d["lotSz"])
+        max_mkt = float(d.get("maxMktSz", 200000))
+        return lot, max_mkt
+    return 1.0, 200000
 
 def get_candles(symbol, interval, limit=200):
     path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
@@ -150,6 +152,8 @@ def run_cycle(symbol, interval):
     ticker = get_ticker(symbol)
     price = ticker["mark"]
 
+    lot, max_limit = get_instrument_limits(symbol)
+
     exch_pos = get_open_position_double_check(symbol)
     if exch_pos == "MISMATCH":
         return {"status": "SYNC MISMATCH"}
@@ -203,10 +207,10 @@ def run_cycle(symbol, interval):
     exposure = risk * LEVERAGE
     raw_size = exposure / price
 
-    lot = get_lot_size(symbol)
     steps = max(1, math.floor(raw_size / lot))
     order_size = steps * lot
-    order_size = min(order_size, MAX_ORDER_SIZE)
+
+    order_size = min(order_size, max_limit)
 
     order = place_market_order(symbol, side, order_size)
     if order.get("code") != "0":
