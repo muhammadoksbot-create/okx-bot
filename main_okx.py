@@ -13,10 +13,10 @@ BASE_URL = "https://www.okx.com"
 CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
 
-SYMBOL = "DOGE-USDT-SWAP"
+SYMBOL = "LINK-USDT-SWAP"   # DOGE removed — LINK added
 INTERVAL = "5m"
 LEVERAGE = 10
-RISK_PCT = 0.02   # wallet ka 2% (Unified Account ke liye perfect)
+RISK_PCT = 0.005   # wallet ka 0.5% — Unified Account safe
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -68,10 +68,10 @@ def get_instrument_limits(symbol):
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
         lot = float(d["lotSz"])
-        max_mkt = float(d.get("maxMktSz", 200000))
+        max_mkt = float(d.get("maxMktSz", 5000))  # LINK ka limit DOGE se chhota hota hai
         return lot, max_mkt
 
-    return 1.0, 200000
+    return 1.0, 5000
 
 # ---------- API ----------
 def get_candles(symbol, interval, limit=200):
