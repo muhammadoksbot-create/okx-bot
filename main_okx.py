@@ -36,7 +36,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"   # DEMO MODE FIX
+        "x-simulated-trading": "1"   # DEMO MODE
     }
 
 # ---------- STATE ----------
@@ -89,7 +89,7 @@ def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
     body = json.dumps({
         "instId": symbol,
-        "tdMode": "isolated",
+        "tdMode": "cross",   # DEMO FIX — cross margin works in demo
         "side": side,
         "ordType": "market",
         "sz": str(size)
