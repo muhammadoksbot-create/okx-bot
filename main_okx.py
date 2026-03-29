@@ -14,9 +14,9 @@ CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
 
 SYMBOL = "DOGE-USDT-SWAP"
-INTERVAL = "15m"
-LEVERAGE = 10
-RISK_PER_TRADE = 10.0
+INTERVAL = "5m"
+LEVERAGE = 10          # 10x leverage
+RISK_PCT = 0.10        # wallet ka 10%
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -80,7 +80,7 @@ def get_ticker(symbol):
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
         last = float(d["last"])
-        mark = float(d.get("markPx", last))   # FIXED
+        mark = float(d.get("markPx", last))
         return {"last": last, "mark": mark}
 
     return {"last": None, "mark": None}
@@ -89,7 +89,7 @@ def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
     body = json.dumps({
         "instId": symbol,
-        "tdMode": "cross",   # DEMO FIX — cross margin works in demo
+        "tdMode": "cross",   # DEMO + cross margin
         "side": side,
         "ordType": "market",
         "sz": str(size)
@@ -285,31 +285,27 @@ def run_cycle(symbol, interval):
 
         return attach_state_snapshot({"status": f"{pos} open"}, state)
 
-    # --- NEW ENTRY ---
-    last_close = closes[-1]
-    prev_close = closes[-2]
-    last_ema9 = ema9_series[-1]
-    prev_ema9 = ema9_series[-2]
-
+    # --- SIMPLE TREND ENTRY (NO PULLBACK) ---
     side = None
     decision = None
 
-    if ema9 > ema21 and prev_close < prev_ema9 and last_close > last_ema9:
+    if ema9 > ema21:
         side = "buy"
-        decision = "LONG_EMA_PULLBACK"
-
-    elif ema9 < ema21 and prev_close > prev_ema9 and last_close < last_ema9:
+        decision = "TREND_LONG"
+    elif ema9 < ema21:
         side = "sell"
-        decision = "SHORT_EMA_PULLBACK"
+        decision = "TREND_SHORT"
 
     if not side:
-        return attach_state_snapshot({"status": "No signal (EMA pullback)"}, state)
+        return attach_state_snapshot({"status": "No signal (trend EMA)"}, state)
 
+    # --- DYNAMIC 10% WALLET RISK ---
     balance = get_usdt_balance()
     if balance is None:
         return attach_state_snapshot({"status": "Balance error"}, state)
 
-    exposure = RISK_PER_TRADE * LEVERAGE
+    risk = balance * RISK_PCT          # wallet ka 10%
+    exposure = risk * LEVERAGE         # 10x leverage
     raw_size = exposure / price
 
     lot = get_lot_size(symbol)
@@ -336,8 +332,8 @@ def run_cycle(symbol, interval):
     real_entry = exch_after["entry"]
     real_size = exch_after["size"]
 
-    SL_PCT = 0.003
-    TP_PCT = 0.003
+    SL_PCT = 0.003   # 0.3%
+    TP_PCT = 0.003   # 0.3%
 
     if pos_side == "long":
         sl = real_entry * (1 - SL_PCT)
@@ -357,7 +353,7 @@ def run_cycle(symbol, interval):
     save_state(state)
 
     return attach_state_snapshot({
-        "status": f"{pos_side} opened (EMA pullback)",
+        "status": f"{pos_side} opened (TREND EMA)",
         "decision": decision
     }, state)
 
