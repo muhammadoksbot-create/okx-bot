@@ -2,7 +2,6 @@ import requests
 import hmac
 import base64
 import json
-import pandas as pd
 import os
 import math
 import time
@@ -15,8 +14,8 @@ STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 10
-RISK_PCT = 0.005   # wallet ka 0.5%
+LEVERAGE = 10          # 10x CONFIRMED
+RISK_PCT = 0.005       # wallet ka 0.5%
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -36,7 +35,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"
+        "x-simulated-trading": "1"   # LIVE me is line ko hata dena
     }
 
 # ---------- STATE ----------
@@ -191,7 +190,6 @@ def detect_structure(swings):
     prev = swings[-2]
     prev2 = swings[-3]
 
-    # Simple structure: uptrend / downtrend
     if prev[0] == "LL" and last[0] == "HH" and last[2] > prev2[2]:
         return "BOS_UP"
     if prev[0] == "HH" and last[0] == "LL" and last[2] < prev2[2]:
@@ -206,16 +204,13 @@ def detect_choch(swings):
     prev2 = swings[-3]
     prev3 = swings[-4]
 
-    # Reversal: from up to down
     if prev3[0] == "HH" and prev[0] == "LL" and last[2] < prev2[2]:
         return "CHoCH_DOWN"
-    # Reversal: from down to up
     if prev3[0] == "LL" and prev[0] == "HH" and last[2] > prev2[2]:
         return "CHoCH_UP"
     return None
 
 def detect_liquidity_sweep(candles, side="long"):
-    # Very simple: last candle wick takes previous high/low
     if len(candles) < 3:
         return False
     last = candles[-1]
@@ -227,19 +222,15 @@ def detect_liquidity_sweep(candles, side="long"):
     low_prev = float(prev[3])
 
     if side == "long":
-        # sweep downside liquidity
         return low_last < low_prev and float(last[4]) > float(prev[4])
     else:
-        # sweep upside liquidity
         return high_last > high_prev and float(last[4]) < float(prev[4])
 
 def detect_order_block(candles, side="long"):
-    # last opposite candle before impulse
     if len(candles) < 5:
         return None
     last5 = candles[-5:]
     if side == "long":
-        # bullish OB: last red before strong green
         for i in range(len(last5) - 2):
             c1 = last5[i]
             c2 = last5[i + 1]
@@ -250,7 +241,6 @@ def detect_order_block(candles, side="long"):
                 ob_high = float(c1[2])
                 return (ob_low, ob_high)
     else:
-        # bearish OB: last green before strong red
         for i in range(len(last5) - 2):
             c1 = last5[i]
             c2 = last5[i + 1]
@@ -263,21 +253,16 @@ def detect_order_block(candles, side="long"):
     return None
 
 def detect_fvg(candles):
-    # simple 3-candle FVG
     if len(candles) < 3:
         return None
     c1, c2, c3 = candles[-3], candles[-2], candles[-1]
     high1 = float(c1[2])
     low1 = float(c1[3])
-    high2 = float(c2[2])
-    low2 = float(c2[3])
     high3 = float(c3[2])
     low3 = float(c3[3])
 
-    # bullish FVG: low3 > high1
     if low3 > high1:
         return ("bull", high1, low3)
-    # bearish FVG: high3 < low1
     if high3 < low1:
         return ("bear", high3, low1)
     return None
@@ -319,6 +304,9 @@ def run_cycle(symbol, interval):
         sl = state["sl"]
         size = state["size"]
 
+        if tp is None or sl is None:
+            return {"status": "POSITION WITHOUT SLTP", "entry": entry, "size": size}
+
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
@@ -347,7 +335,7 @@ def run_cycle(symbol, interval):
             "size": size
         }
 
-    # ---------- SMC LOGIC (Reversal + Continuation) ----------
+    # ---------- SMC LOGIC ----------
     swings = find_swings(closes)
     structure = detect_structure(swings)
     choch = detect_choch(swings)
@@ -356,7 +344,7 @@ def run_cycle(symbol, interval):
     side = None
     reason = None
 
-    # Reversal entries (CHoCH + OB + sweep)
+    # Reversal entries
     if choch == "CHoCH_UP":
         if detect_liquidity_sweep(candles, side="long"):
             ob = detect_order_block(candles, side="long")
@@ -375,7 +363,7 @@ def run_cycle(symbol, interval):
                     side = "sell"
                     reason = "SMC_REVERSAL_SHORT"
 
-    # Continuation entries (BOS + FVG)
+    # Continuation entries
     if side is None and structure == "BOS_UP" and fvg and fvg[0] == "bull":
         _, f_low, f_high = fvg
         if f_low <= price <= f_high:
