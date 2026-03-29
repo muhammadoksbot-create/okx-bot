@@ -13,10 +13,10 @@ BASE_URL = "https://www.okx.com"
 CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
 
-SYMBOL = "LINK-USDT-SWAP"   # DOGE removed — LINK added
+SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
 LEVERAGE = 10
-RISK_PCT = 0.005   # wallet ka 0.5% — Unified Account safe
+RISK_PCT = 0.005   # wallet ka 0.5%
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -36,7 +36,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"   # DEMO MODE — LIVE me is line ko hata dena
+        "x-simulated-trading": "1"
     }
 
 # ---------- STATE ----------
@@ -68,7 +68,7 @@ def get_instrument_limits(symbol):
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
         lot = float(d["lotSz"])
-        max_mkt = float(d.get("maxMktSz", 5000))  # LINK ka limit DOGE se chhota hota hai
+        max_mkt = float(d.get("maxMktSz", 5000))
         return lot, max_mkt
 
     return 1.0, 5000
@@ -169,20 +169,129 @@ def ema(values, period):
         e = v * k + e * (1 - k)
     return e
 
+# ---------- SMC HELPERS ----------
+def find_swings(closes, lookback=3):
+    swings = []
+    n = len(closes)
+    for i in range(lookback, n - lookback):
+        high = closes[i]
+        low = closes[i]
+        is_high = all(high >= closes[i - j] and high >= closes[i + j] for j in range(1, lookback + 1))
+        is_low = all(low <= closes[i - j] and low <= closes[i + j] for j in range(1, lookback + 1))
+        if is_high:
+            swings.append(("HH", i, closes[i]))
+        if is_low:
+            swings.append(("LL", i, closes[i]))
+    return swings
+
+def detect_structure(swings):
+    if len(swings) < 3:
+        return None
+    last = swings[-1]
+    prev = swings[-2]
+    prev2 = swings[-3]
+
+    # Simple structure: uptrend / downtrend
+    if prev[0] == "LL" and last[0] == "HH" and last[2] > prev2[2]:
+        return "BOS_UP"
+    if prev[0] == "HH" and last[0] == "LL" and last[2] < prev2[2]:
+        return "BOS_DOWN"
+    return None
+
+def detect_choch(swings):
+    if len(swings) < 4:
+        return None
+    last = swings[-1]
+    prev = swings[-2]
+    prev2 = swings[-3]
+    prev3 = swings[-4]
+
+    # Reversal: from up to down
+    if prev3[0] == "HH" and prev[0] == "LL" and last[2] < prev2[2]:
+        return "CHoCH_DOWN"
+    # Reversal: from down to up
+    if prev3[0] == "LL" and prev[0] == "HH" and last[2] > prev2[2]:
+        return "CHoCH_UP"
+    return None
+
+def detect_liquidity_sweep(candles, side="long"):
+    # Very simple: last candle wick takes previous high/low
+    if len(candles) < 3:
+        return False
+    last = candles[-1]
+    prev = candles[-2]
+
+    high_last = float(last[2])
+    low_last = float(last[3])
+    high_prev = float(prev[2])
+    low_prev = float(prev[3])
+
+    if side == "long":
+        # sweep downside liquidity
+        return low_last < low_prev and float(last[4]) > float(prev[4])
+    else:
+        # sweep upside liquidity
+        return high_last > high_prev and float(last[4]) < float(prev[4])
+
+def detect_order_block(candles, side="long"):
+    # last opposite candle before impulse
+    if len(candles) < 5:
+        return None
+    last5 = candles[-5:]
+    if side == "long":
+        # bullish OB: last red before strong green
+        for i in range(len(last5) - 2):
+            c1 = last5[i]
+            c2 = last5[i + 1]
+            open1, close1 = float(c1[1]), float(c1[4])
+            open2, close2 = float(c2[1]), float(c2[4])
+            if close1 < open1 and close2 > open2 and (close2 - open2) > (open1 - close1):
+                ob_low = float(c1[3])
+                ob_high = float(c1[2])
+                return (ob_low, ob_high)
+    else:
+        # bearish OB: last green before strong red
+        for i in range(len(last5) - 2):
+            c1 = last5[i]
+            c2 = last5[i + 1]
+            open1, close1 = float(c1[1]), float(c1[4])
+            open2, close2 = float(c2[1]), float(c2[4])
+            if close1 > open1 and close2 < open2 and (open2 - close2) > (close1 - open1):
+                ob_low = float(c1[3])
+                ob_high = float(c1[2])
+                return (ob_low, ob_high)
+    return None
+
+def detect_fvg(candles):
+    # simple 3-candle FVG
+    if len(candles) < 3:
+        return None
+    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
+    high1 = float(c1[2])
+    low1 = float(c1[3])
+    high2 = float(c2[2])
+    low2 = float(c2[3])
+    high3 = float(c3[2])
+    low3 = float(c3[3])
+
+    # bullish FVG: low3 > high1
+    if low3 > high1:
+        return ("bull", high1, low3)
+    # bearish FVG: high3 < low1
+    if high3 < low1:
+        return ("bear", high3, low1)
+    return None
+
 # ---------- CORE ----------
 def run_cycle(symbol, interval):
     state = load_state()
 
-    # --- CANDLES ---
     data = get_candles(symbol, interval)
     if data.get("code") != "0":
         return {"status": "Candle error"}
 
     candles = list(reversed(data["data"]))
     closes = [float(c[4]) for c in candles]
-
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
 
     ticker = get_ticker(symbol)
     price = ticker["mark"]
@@ -214,49 +323,90 @@ def run_cycle(symbol, interval):
             if price >= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG TP HIT"}
-
+                return {"status": "LONG TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
             if price <= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG SL HIT"}
+                return {"status": "LONG SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
 
         if pos == "short":
             if price <= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT TP HIT"}
-
+                return {"status": "SHORT TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
             if price >= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT SL HIT"}
+                return {"status": "SHORT SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
 
-        return {"status": f"{pos} open"}
+        return {
+            "status": f"{pos} open",
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "size": size
+        }
 
-    # --- ENTRY SIGNAL ---
+    # ---------- SMC LOGIC (Reversal + Continuation) ----------
+    swings = find_swings(closes)
+    structure = detect_structure(swings)
+    choch = detect_choch(swings)
+    fvg = detect_fvg(candles)
+
     side = None
-    if ema9 > ema21:
-        side = "buy"
-    elif ema9 < ema21:
-        side = "sell"
-    else:
-        return {"status": "No signal"}
+    reason = None
+
+    # Reversal entries (CHoCH + OB + sweep)
+    if choch == "CHoCH_UP":
+        if detect_liquidity_sweep(candles, side="long"):
+            ob = detect_order_block(candles, side="long")
+            if ob:
+                ob_low, ob_high = ob
+                if ob_low <= price <= ob_high:
+                    side = "buy"
+                    reason = "SMC_REVERSAL_LONG"
+
+    if choch == "CHoCH_DOWN":
+        if detect_liquidity_sweep(candles, side="short"):
+            ob = detect_order_block(candles, side="short")
+            if ob:
+                ob_low, ob_high = ob
+                if ob_low <= price <= ob_high:
+                    side = "sell"
+                    reason = "SMC_REVERSAL_SHORT"
+
+    # Continuation entries (BOS + FVG)
+    if side is None and structure == "BOS_UP" and fvg and fvg[0] == "bull":
+        _, f_low, f_high = fvg
+        if f_low <= price <= f_high:
+            side = "buy"
+            reason = "SMC_CONTINUATION_LONG"
+
+    if side is None and structure == "BOS_DOWN" and fvg and fvg[0] == "bear":
+        _, f_low, f_high = fvg
+        if f_low <= price <= f_high:
+            side = "sell"
+            reason = "SMC_CONTINUATION_SHORT"
+
+    if side is None:
+        return {"status": "No SMC signal", "structure": structure, "choch": choch}
 
     # --- DYNAMIC RISK ---
     balance = get_usdt_balance()
+    if balance is None:
+        return {"status": "Balance error"}
+
     risk = balance * RISK_PCT
     exposure = risk * LEVERAGE
     raw_size = exposure / price
 
-    # --- LOT FIX ---
     steps = max(1, math.floor(raw_size / lot))
     order_size = steps * lot
-
-    # --- REAL-TIME MAX LIMIT FIX ---
     order_size = min(order_size, max_limit)
 
-    # --- PLACE ORDER ---
+    if order_size <= 0:
+        return {"status": "Order size too small"}
+
     order = place_market_order(symbol, side, order_size)
 
     if order.get("code") != "0":
@@ -291,7 +441,13 @@ def run_cycle(symbol, interval):
     })
     save_state(state)
 
-    return {"status": f"{pos_side} opened"}
+    return {
+        "status": f"{pos_side} opened ({reason})",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "size": size
+    }
 
 # ---------- MAIN ----------
 def main():
@@ -300,7 +456,7 @@ def main():
     while True:
         info = run_cycle(SYMBOL, INTERVAL)
         print(datetime.utcnow().isoformat(), info)
-        time.sleep(60)   # 1-minute cycle
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
