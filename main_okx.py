@@ -188,7 +188,7 @@ def ema_series(values, period):
 # ---------- CSV ----------
 def save_trade(data):
     df = pd.DataFrame([data])
-    df.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
+    df.to_csv(CSV_FILE, mode="a", header=not os.path_exists(CSV_FILE), index=False)
 
 # ---------- SNAPSHOT ----------
 def attach_state_snapshot(info, state):
@@ -309,12 +309,14 @@ def run_cycle(symbol, interval):
     raw_size = exposure / price
 
     lot = get_lot_size(symbol)
-    steps = math.floor(raw_size / lot)
 
-    if steps <= 0:
+    # LOT FIX: minimum 1 lot, and multiple of lot size
+    steps = max(1, math.floor(raw_size / lot))
+    order_size = steps * lot
+
+    if order_size <= 0:
         return attach_state_snapshot({"status": "Order size too small"}, state)
 
-    order_size = steps * lot
     pos_side = "long" if side == "buy" else "short"
 
     order = place_market_order(symbol, side, order_size)
