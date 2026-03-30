@@ -14,7 +14,7 @@ STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 10          # 10x CONFIRMED
+LEVERAGE = 10          # 10x
 RISK_PCT = 0.005       # wallet ka 0.5%
 
 # ---------- SIGN ----------
@@ -407,8 +407,9 @@ def run_cycle(symbol, interval):
     entry = exch_after["entry"]
     size = exch_after["size"]
 
-    SL_PCT = 0.003
-    TP_PCT = 0.003
+    # ---------- UPDATED TP/SL ----------
+    SL_PCT = 0.005   # 0.5% SL
+    TP_PCT = 0.01    # 1% TP
 
     if side == "buy":
         sl = entry * (1 - SL_PCT)
