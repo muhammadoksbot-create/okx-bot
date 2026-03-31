@@ -34,7 +34,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"
+        "x-simulated-trading": "1"   # LIVE me is line ko hata dena
     }
 
 # ---------- STATE ----------
@@ -65,9 +65,15 @@ def get_candles(symbol, interval, limit=200):
 def get_ticker(symbol):
     path = f"/api/v5/market/ticker?instId={symbol}"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
+
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
-        return float(d["markPx"])
+        if "markPx" in d:
+            return float(d["markPx"])
+        elif "last" in d:
+            return float(d["last"])
+        else:
+            return None
     return None
 
 def place_market_order(symbol, side, size):
@@ -108,7 +114,7 @@ def get_usdt_balance():
 
     for d in r["data"][0]["details"]:
         if d["ccy"] == "USDT":
-            return float(d["availBal"])
+            return float(d.get("availBal", d.get("eq", 0)))
     return None
 
 # ---------- SMC HELPERS ----------
@@ -187,10 +193,15 @@ def detect_fvg(candles):
     if len(candles) < 3:
         return None
     c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    if float(c3[3]) > float(c1[2]):
-        return ("bull", float(c1[2]), float(c3[3]))
-    if float(c3[2]) < float(c1[3]):
-        return ("bear", float(c3[2]), float(c3[3]))
+    high1 = float(c1[2])
+    low1 = float(c1[3])
+    high3 = float(c3[2])
+    low3 = float(c3[3])
+
+    if low3 > high1:
+        return ("bull", high1, low3)
+    if high3 < low1:
+        return ("bear", high3, low1)
     return None
 
 # ---------- CORE ----------
@@ -229,23 +240,29 @@ def run_cycle(symbol, interval):
             if price >= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG TP HIT"}
+                return {"status": "LONG TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
             if price <= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG SL HIT"}
+                return {"status": "LONG SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
 
         if pos == "short":
             if price <= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT TP HIT"}
+                return {"status": "SHORT TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
             if price >= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT SL HIT"}
+                return {"status": "SHORT SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
 
-        return {"status": f"{pos} open", "entry": entry, "tp": tp, "sl": sl}
+        return {
+            "status": f"{pos} open",
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "size": size
+        }
 
     # SMC Logic
     swings = find_swings(closes)
@@ -258,11 +275,13 @@ def run_cycle(symbol, interval):
 
     if choch == "CHoCH_UP":
         if detect_liquidity_sweep(candles, "long"):
+            ob = detect_order_block(candles, "long")
             side = "buy"
             reason = "SMC_REVERSAL_LONG"
 
     if choch == "CHoCH_DOWN":
         if detect_liquidity_sweep(candles, "short"):
+            ob = detect_order_block(candles, "short")
             side = "sell"
             reason = "SMC_REVERSAL_SHORT"
 
@@ -275,16 +294,16 @@ def run_cycle(symbol, interval):
         reason = "SMC_CONTINUATION_SHORT"
 
     if side is None:
-        return {"status": "No SMC signal"}
+        return {"status": "No SMC signal", "structure": structure, "choch": choch}
 
     # ---------- POSITION SIZE = WALLET KA 10% ----------
     balance = get_usdt_balance()
     if balance is None:
         return {"status": "Balance error"}
 
-    position_value = balance * POSITION_PCT
-    exposure = position_value * LEVERAGE
-    size = exposure / price
+    position_value = balance * POSITION_PCT      # wallet ka 10%
+    exposure = position_value * LEVERAGE         # 10x
+    size = exposure / price                      # coin size
 
     size = round(size, 2)
 
@@ -299,9 +318,9 @@ def run_cycle(symbol, interval):
     entry = exch_after["entry"]
     size = exch_after["size"]
 
-    # ---------- SL / TP ----------
-    SL_PCT = 0.005
-    TP_PCT = 0.01
+    # ---------- SL / TP (1:2 RR) ----------
+    SL_PCT = 0.005   # 0.5%
+    TP_PCT = 0.01    # 1%
 
     if side == "buy":
         sl = entry * (1 - SL_PCT)
