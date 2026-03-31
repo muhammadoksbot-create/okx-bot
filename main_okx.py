@@ -9,13 +9,12 @@ from datetime import datetime
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
 BASE_URL = "https://www.okx.com"
-CSV_FILE = "trade_history.csv"
 STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 10          # 10x
-RISK_PCT = 0.005       # wallet ka 0.5%
+LEVERAGE = 10          # 10x leverage
+POSITION_PCT = 0.10    # Wallet ka 10%
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -35,7 +34,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"   # LIVE me is line ko hata dena
+        "x-simulated-trading": "1"
     }
 
 # ---------- STATE ----------
@@ -45,8 +44,7 @@ def default_state():
         "entry": None,
         "tp": None,
         "sl": None,
-        "size": None,
-        "symbol": None
+        "size": None
     }
 
 def load_state():
@@ -59,19 +57,6 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-# ---------- INSTRUMENT LIMITS ----------
-def get_instrument_limits(symbol):
-    path = f"/api/v5/public/instruments?instType=SWAP&instId={symbol}"
-    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
-    if r.get("code") == "0" and r.get("data"):
-        d = r["data"][0]
-        lot = float(d["lotSz"])
-        max_mkt = float(d.get("maxMktSz", 5000))
-        return lot, max_mkt
-
-    return 1.0, 5000
-
 # ---------- API ----------
 def get_candles(symbol, interval, limit=200):
     path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
@@ -80,14 +65,10 @@ def get_candles(symbol, interval, limit=200):
 def get_ticker(symbol):
     path = f"/api/v5/market/ticker?instId={symbol}"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
-        last = float(d["last"])
-        mark = float(d.get("markPx", last))
-        return {"last": last, "mark": mark}
-
-    return {"last": None, "mark": None}
+        return float(d["markPx"])
+    return None
 
 def place_market_order(symbol, side, size):
     path = "/api/v5/trade/order"
@@ -98,75 +79,37 @@ def place_market_order(symbol, side, size):
         "ordType": "market",
         "sz": str(size)
     })
-
-    try:
-        return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
-    except Exception as e:
-        return {"code": "-1", "msg": f"REQUEST ERROR: {e}"}
+    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
 
 def close_position(symbol, side, size):
     opposite = "sell" if side == "long" else "buy"
     return place_market_order(symbol, opposite, size)
 
-# ---------- POSITION ----------
-def get_open_position_once(symbol):
+def get_open_position(symbol):
     path = "/api/v5/account/positions"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
     if r.get("code") != "0":
         return None
 
-    for p in r.get("data", []):
-        if p.get("instId") != symbol:
-            continue
-
-        pos_val = float(p.get("pos", "0"))
-        if pos_val == 0:
-            continue
-
-        return {
-            "position": "long" if pos_val > 0 else "short",
-            "entry": float(p.get("avgPx", 0)),
-            "size": abs(pos_val)
-        }
-
+    for p in r["data"]:
+        if p["instId"] == symbol and float(p["pos"]) != 0:
+            return {
+                "position": "long" if float(p["pos"]) > 0 else "short",
+                "entry": float(p["avgPx"]),
+                "size": abs(float(p["pos"]))
+            }
     return None
 
-def get_open_position_double_check(symbol):
-    p1 = get_open_position_once(symbol)
-    p2 = get_open_position_once(symbol)
-
-    if p1 is None and p2 is None:
-        return None
-
-    if p1 and p2 and p1["position"] == p2["position"]:
-        return p1
-
-    return "MISMATCH"
-
-# ---------- BALANCE ----------
 def get_usdt_balance():
     path = "/api/v5/account/balance"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
     if r.get("code") != "0":
         return None
 
     for d in r["data"][0]["details"]:
         if d["ccy"] == "USDT":
-            return float(d.get("availBal", d.get("eq", 0)))
-
+            return float(d["availBal"])
     return None
-
-# ---------- INDICATORS ----------
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
 
 # ---------- SMC HELPERS ----------
 def find_swings(closes, lookback=3):
@@ -222,49 +165,32 @@ def detect_liquidity_sweep(candles, side="long"):
     low_prev = float(prev[3])
 
     if side == "long":
-        return low_last < low_prev and float(last[4]) > float(prev[4])
+        return low_last < low_prev
     else:
-        return high_last > high_prev and float(last[4]) < float(prev[4])
+        return high_last > high_prev
 
 def detect_order_block(candles, side="long"):
     if len(candles) < 5:
         return None
     last5 = candles[-5:]
     if side == "long":
-        for i in range(len(last5) - 2):
-            c1 = last5[i]
-            c2 = last5[i + 1]
-            open1, close1 = float(c1[1]), float(c1[4])
-            open2, close2 = float(c2[1]), float(c2[4])
-            if close1 < open1 and close2 > open2 and (close2 - open2) > (open1 - close1):
-                ob_low = float(c1[3])
-                ob_high = float(c1[2])
-                return (ob_low, ob_high)
+        for c in last5:
+            if float(c[4]) < float(c[1]):
+                return (float(c[3]), float(c[2]))
     else:
-        for i in range(len(last5) - 2):
-            c1 = last5[i]
-            c2 = last5[i + 1]
-            open1, close1 = float(c1[1]), float(c1[4])
-            open2, close2 = float(c2[1]), float(c2[4])
-            if close1 > open1 and close2 < open2 and (open2 - close2) > (close1 - open1):
-                ob_low = float(c1[3])
-                ob_high = float(c1[2])
-                return (ob_low, ob_high)
+        for c in last5:
+            if float(c[4]) > float(c[1]):
+                return (float(c[3]), float(c[2]))
     return None
 
 def detect_fvg(candles):
     if len(candles) < 3:
         return None
     c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    high1 = float(c1[2])
-    low1 = float(c1[3])
-    high3 = float(c3[2])
-    low3 = float(c3[3])
-
-    if low3 > high1:
-        return ("bull", high1, low3)
-    if high3 < low1:
-        return ("bear", high3, low1)
+    if float(c3[3]) > float(c1[2]):
+        return ("bull", float(c1[2]), float(c3[3]))
+    if float(c3[2]) < float(c1[3]):
+        return ("bear", float(c3[2]), float(c3[3]))
     return None
 
 # ---------- CORE ----------
@@ -278,17 +204,12 @@ def run_cycle(symbol, interval):
     candles = list(reversed(data["data"]))
     closes = [float(c[4]) for c in candles]
 
-    ticker = get_ticker(symbol)
-    price = ticker["mark"]
+    price = get_ticker(symbol)
+    if price is None:
+        return {"status": "Price error"}
 
-    lot, max_limit = get_instrument_limits(symbol)
-
-    # --- SYNC ---
-    exch_pos = get_open_position_double_check(symbol)
-
-    if exch_pos == "MISMATCH":
-        return {"status": "SYNC MISMATCH"}
-
+    # Sync with exchange
+    exch_pos = get_open_position(symbol)
     if exch_pos:
         state.update(exch_pos)
         save_state(state)
@@ -296,7 +217,7 @@ def run_cycle(symbol, interval):
         state = default_state()
         save_state(state)
 
-    # --- MANAGE OPEN POSITION ---
+    # Manage open position
     if state["position"]:
         pos = state["position"]
         entry = state["entry"]
@@ -304,38 +225,29 @@ def run_cycle(symbol, interval):
         sl = state["sl"]
         size = state["size"]
 
-        if tp is None or sl is None:
-            return {"status": "POSITION WITHOUT SLTP", "entry": entry, "size": size}
-
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "LONG TP HIT"}
             if price <= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "LONG SL HIT"}
 
         if pos == "short":
             if price <= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "SHORT TP HIT"}
             if price >= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "SHORT SL HIT"}
 
-        return {
-            "status": f"{pos} open",
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "size": size
-        }
+        return {"status": f"{pos} open", "entry": entry, "tp": tp, "sl": sl}
 
-    # ---------- SMC LOGIC ----------
+    # SMC Logic
     swings = find_swings(closes)
     structure = detect_structure(swings)
     choch = detect_choch(swings)
@@ -344,72 +256,52 @@ def run_cycle(symbol, interval):
     side = None
     reason = None
 
-    # Reversal entries
     if choch == "CHoCH_UP":
-        if detect_liquidity_sweep(candles, side="long"):
-            ob = detect_order_block(candles, side="long")
-            if ob:
-                ob_low, ob_high = ob
-                if ob_low <= price <= ob_high:
-                    side = "buy"
-                    reason = "SMC_REVERSAL_LONG"
+        if detect_liquidity_sweep(candles, "long"):
+            side = "buy"
+            reason = "SMC_REVERSAL_LONG"
 
     if choch == "CHoCH_DOWN":
-        if detect_liquidity_sweep(candles, side="short"):
-            ob = detect_order_block(candles, side="short")
-            if ob:
-                ob_low, ob_high = ob
-                if ob_low <= price <= ob_high:
-                    side = "sell"
-                    reason = "SMC_REVERSAL_SHORT"
+        if detect_liquidity_sweep(candles, "short"):
+            side = "sell"
+            reason = "SMC_REVERSAL_SHORT"
 
-    # Continuation entries
     if side is None and structure == "BOS_UP" and fvg and fvg[0] == "bull":
-        _, f_low, f_high = fvg
-        if f_low <= price <= f_high:
-            side = "buy"
-            reason = "SMC_CONTINUATION_LONG"
+        side = "buy"
+        reason = "SMC_CONTINUATION_LONG"
 
     if side is None and structure == "BOS_DOWN" and fvg and fvg[0] == "bear":
-        _, f_low, f_high = fvg
-        if f_low <= price <= f_high:
-            side = "sell"
-            reason = "SMC_CONTINUATION_SHORT"
+        side = "sell"
+        reason = "SMC_CONTINUATION_SHORT"
 
     if side is None:
-        return {"status": "No SMC signal", "structure": structure, "choch": choch}
+        return {"status": "No SMC signal"}
 
-    # --- DYNAMIC RISK ---
+    # ---------- POSITION SIZE = WALLET KA 10% ----------
     balance = get_usdt_balance()
     if balance is None:
         return {"status": "Balance error"}
 
-    risk = balance * RISK_PCT
-    exposure = risk * LEVERAGE
-    raw_size = exposure / price
+    position_value = balance * POSITION_PCT
+    exposure = position_value * LEVERAGE
+    size = exposure / price
 
-    steps = max(1, math.floor(raw_size / lot))
-    order_size = steps * lot
-    order_size = min(order_size, max_limit)
+    size = round(size, 2)
 
-    if order_size <= 0:
-        return {"status": "Order size too small"}
-
-    order = place_market_order(symbol, side, order_size)
-
+    order = place_market_order(symbol, side, size)
     if order.get("code") != "0":
         return {"status": "ORDER FAILED", "order": order}
 
-    exch_after = get_open_position_double_check(symbol)
+    exch_after = get_open_position(symbol)
     if not exch_after:
-        return {"status": "ENTRY LOCK FAILED"}
+        return {"status": "ENTRY FAILED"}
 
     entry = exch_after["entry"]
     size = exch_after["size"]
 
-    # ---------- UPDATED TP/SL ----------
-    SL_PCT = 0.005   # 0.5% SL
-    TP_PCT = 0.01    # 1% TP
+    # ---------- SL / TP ----------
+    SL_PCT = 0.005
+    TP_PCT = 0.01
 
     if side == "buy":
         sl = entry * (1 - SL_PCT)
@@ -425,8 +317,7 @@ def run_cycle(symbol, interval):
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "size": size,
-        "symbol": symbol
+        "size": size
     })
     save_state(state)
 
