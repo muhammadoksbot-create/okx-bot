@@ -13,7 +13,7 @@ STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 10          # 10x leverage
+LEVERAGE = 5           # 5x leverage (exchange bhi 5x tak hi allow kar raha hai)
 POSITION_PCT = 0.10    # Wallet ka 10%
 
 # ---------- SIGN ----------
@@ -302,7 +302,7 @@ def run_cycle(symbol, interval):
         return {"status": "Balance error"}
 
     position_value = balance * POSITION_PCT      # wallet ka 10%
-    exposure = position_value * LEVERAGE         # 10x
+    exposure = position_value * LEVERAGE         # 5x
     size = exposure / price                      # coin size
 
     size = round(size, 2)
