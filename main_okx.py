@@ -34,7 +34,7 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
-        "x-simulated-trading": "1"   # LIVE me is line ko hata dena
+       
     }
 
 # ---------- STATE ----------
