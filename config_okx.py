@@ -1,5 +1,5 @@
-API_KEY = "a948a204-3cbe-4855-a711-2d9401973afd"
-SECRET_KEY = "C778702E1A56AD1788146C79967A28F1"
-PASSPHRASE = "Awais@2024"
+API_KEY = "9b865a0a-c9ee-4ee6-8047-39174c464898"
+SECRET_KEY = "A5B183ED51DFC7A89D572BA13D8A25EE"
+PASSPHRASE = "Password@26"
 
-IS_DEMO = True   # Paper trading ke liye hamesha True
+IS_DEMO = False   # Paper trading ke liye hamesha True
