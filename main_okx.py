@@ -252,51 +252,44 @@ def detect_liquidity(candles: list) -> bool:
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     """
-    Step 1: Place market order.
-    Step 2: Place separate algo order for TP/SL.
+    Single API call: Market order with attached TP/SL algo orders.
     """
-    # Ensure size is integer
     sz_int = int(size)
+    tp_str = str(round(tp, 4))
+    sl_str = str(round(sl, 4))
     
-    # ---- Step 1: Market Order ----
-    body_market = json.dumps({
+    # Generate unique client order IDs
+    algo_id_tp = f"tp_{int(time.time() * 1000)}"
+    algo_id_sl = f"sl_{int(time.time() * 1000)}"
+    
+    body = json.dumps({
         "instId":  SYMBOL,
         "tdMode":  "cross",
         "side":    side,
         "ordType": "market",
-        "sz":      str(sz_int)
+        "sz":      str(sz_int),
+        "attachAlgoOrds": [
+            {
+                "attachAlgoClOrdId": algo_id_tp,
+                "tpTriggerPx":       tp_str,
+                "tpOrdPx":           "-1"
+            },
+            {
+                "attachAlgoClOrdId": algo_id_sl,
+                "slTriggerPx":       sl_str,
+                "slOrdPx":           "-1"
+            }
+        ]
     })
-    result = req("POST", "/api/v5/trade/order", body_market)
-    if result.get("code") != "0":
-        log("ORDER", f"❌ Market order failed: {result}")
-        return result
     
-    try:
-        ordId = result["data"][0]["ordId"]
-        log("ORDER", f"✅ Market order placed. ID: {ordId}")
-    except:
-        log("ORDER", "Market order placed but couldn't fetch ordId")
-        return result
+    log("DEBUG", f"Order Payload: {body}")
+    result = req("POST", "/api/v5/trade/order", body)
     
-    # ---- Step 2: Algo Order (TP/SL) ----
-    body_algo = json.dumps({
-        "instId":      SYMBOL,
-        "tdMode":      "cross",
-        "side":        "sell" if side == "buy" else "buy",
-        "ordType":     "conditional",
-        "sz":          str(sz_int),
-        "algoClOrdId": f"tp_{int(time.time())}",
-        "tpTriggerPx": str(round(tp, 4)),
-        "tpOrdPx":     "-1",
-        "slTriggerPx": str(round(sl, 4)),
-        "slOrdPx":     "-1"
-    })
-    algo_res = req("POST", "/api/v5/trade/order-algo", body_algo)
-    if algo_res.get("code") != "0":
-        log("ALGO", f"❌ TP/SL placement failed: {algo_res}")
-        send_telegram(f"⚠️ TP/SL FAILED\n{result}\n{algo_res}")
+    if result.get("code") == "0":
+        log("ORDER", "✅ Market order with TP/SL placed successfully")
     else:
-        log("ALGO", "✅ TP/SL algo order placed.")
+        log("ORDER", f"❌ Order failed: {result}")
+        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{result}")
     
     return result
 
