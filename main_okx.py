@@ -34,7 +34,6 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
-        # LIVE mode — simulation header removed
     }
 
 # ---------- STATE ----------
@@ -102,8 +101,7 @@ def get_usdt_balance():
         if d["ccy"] == "USDT":
             return float(d.get("availBal", d.get("eq", 0)))
     return None
-
-# ---------- SMC HELPERS ----------
+    # ---------- SMC HELPERS ----------
 def find_swings(closes, lookback=3):
     swings = []
     n = len(closes)
@@ -181,6 +179,7 @@ def run_cycle(symbol, interval):
     if price is None:
         return {"status": "Price error"}
 
+    # Sync with exchange
     exch_pos = get_open_position(symbol)
     if exch_pos:
         state.update(exch_pos)
@@ -189,8 +188,22 @@ def run_cycle(symbol, interval):
         state = default_state()
         save_state(state)
 
+    # ---------- PRINT CURRENT POSITION ----------
     if state["position"]:
-        pos, entry, tp, sl, size = state.values()
+        print("\n--- CURRENT OPEN POSITION ---")
+        print("Side:", state["position"])
+        print("Entry:", state["entry"])
+        print("TP:", state["tp"])
+        print("SL:", state["sl"])
+        print("Size:", state["size"])
+        print("-----------------------------\n")
+
+        pos = state["position"]
+        entry = state["entry"]
+        tp = state["tp"]
+        sl = state["sl"]
+        size = state["size"]
+
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
@@ -213,6 +226,7 @@ def run_cycle(symbol, interval):
 
         return {"status": f"{pos} open"}
 
+    # ---------- SMC LOGIC ----------
     swings = find_swings(closes)
     structure = detect_structure(swings)
     choch = detect_choch(swings)
@@ -236,6 +250,7 @@ def run_cycle(symbol, interval):
     if side is None:
         return {"status": "No SMC signal"}
 
+    # ---------- POSITION SIZE ----------
     balance = get_usdt_balance()
     if balance is None:
         return {"status": "Balance error"}
@@ -244,7 +259,7 @@ def run_cycle(symbol, interval):
     exposure = position_value * LEVERAGE
     size = exposure / price
 
-    size = math.floor(size * 10) / 10.0   # LOT SIZE FIX (0.1 step)
+    size = math.floor(size * 10) / 10.0   # LOT SIZE FIX
 
     order = place_market_order(symbol, side, size)
     if order.get("code") != "0":
@@ -271,6 +286,15 @@ def run_cycle(symbol, interval):
 
     state.update({"position": pos_side, "entry": entry, "tp": tp, "sl": sl, "size": size})
     save_state(state)
+
+    print("\n--- NEW TRADE OPENED ---")
+    print("Side:", pos_side)
+    print("Entry:", entry)
+    print("TP:", tp)
+    print("SL:", sl)
+    print("Size:", size)
+    print("Reason:", reason)
+    print("-------------------------\n")
 
     return {"status": f"{pos_side} opened ({reason})"}
 
