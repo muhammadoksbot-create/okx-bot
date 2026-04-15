@@ -281,9 +281,8 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     tp_str = str(round(tp, 4))
     sl_str = str(round(sl, 4))
     
-    # Generate unique client order IDs
-    algo_id_tp = f"tp_{int(time.time() * 1000)}"
-    algo_id_sl = f"sl_{int(time.time() * 1000)}"
+    # Unique ID sirf ek baar (OKX ek object mein dono TP/SL chahta hai)
+    algo_id = f"tp_{int(time.time() * 1000)}"
     
     body = json.dumps({
         "instId":  SYMBOL,
@@ -293,12 +292,9 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
         "sz":      str(sz_int),
         "attachAlgoOrds": [
             {
-                "attachAlgoClOrdId": algo_id_tp,
+                "attachAlgoClOrdId": algo_id,
                 "tpTriggerPx":       tp_str,
-                "tpOrdPx":           "-1"
-            },
-            {
-                "attachAlgoClOrdId": algo_id_sl,
+                "tpOrdPx":           "-1",
                 "slTriggerPx":       sl_str,
                 "slOrdPx":           "-1"
             }
