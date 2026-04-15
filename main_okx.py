@@ -9,7 +9,19 @@ SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
 
 LEVERAGE = 5
-POSITION_PCT = 0.50   # ✅ 50% wallet
+POSITION_PCT = 0.50
+
+# 🔔 TELEGRAM
+TELEGRAM_TOKEN = "YOUR_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
+
+# ---------- TELEGRAM ----------
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except:
+        pass
 
 # ---------- AUTH ----------
 def sign(message):
@@ -28,7 +40,7 @@ def headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ---------- SAFE REQUEST ----------
+# ---------- REQUEST ----------
 def req(method, path, body=None):
     try:
         url = BASE_URL + path
@@ -37,10 +49,10 @@ def req(method, path, body=None):
             return requests.get(url, headers=h, timeout=10).json()
         return requests.post(url, headers=h, data=body, timeout=10).json()
     except Exception as e:
-        print("API ERROR:", e)
+        send_telegram(f"⚠️ API ERROR: {e}")
         return {}
 
-# ---------- SET LEVERAGE ----------
+# ---------- LEVERAGE ----------
 def set_leverage():
     body = json.dumps({
         "instId": SYMBOL,
@@ -127,6 +139,7 @@ def order(side, size):
 # ---------- CORE ----------
 def run():
     s = load()
+
     c = candles()
     if not c: return "No data"
 
@@ -134,10 +147,39 @@ def run():
     p = price()
     if not p: return "No price"
 
-    # cooldown
-    if s.get("last_trade") and time.time() - s["last_trade"] < 300:
-        return "Cooldown"
+    # ---------- TP/SL CHECK ----------
+    if s.get("pos"):
+        pos = s["pos"]
 
+        if pos == "buy":
+            if p >= s["tp"]:
+                order("sell", s["size"])
+                send_telegram(f"🎯 TP HIT\n{SYMBOL}\nPrice: {p}")
+                save({"pos": None})
+                return "TP HIT"
+
+            if p <= s["sl"]:
+                order("sell", s["size"])
+                send_telegram(f"❌ SL HIT\n{SYMBOL}\nPrice: {p}")
+                save({"pos": None})
+                return "SL HIT"
+
+        if pos == "sell":
+            if p <= s["tp"]:
+                order("buy", s["size"])
+                send_telegram(f"🎯 TP HIT\n{SYMBOL}\nPrice: {p}")
+                save({"pos": None})
+                return "TP HIT"
+
+            if p >= s["sl"]:
+                order("buy", s["size"])
+                send_telegram(f"❌ SL HIT\n{SYMBOL}\nPrice: {p}")
+                save({"pos": None})
+                return "SL HIT"
+
+        return "Position running"
+
+    # ---------- ENTRY ----------
     sw = swings(closes)
     st = structure(sw)
     ch = choch(sw)
@@ -161,16 +203,14 @@ def run():
     bal = balance()
     if not bal: return "No balance"
 
-    # ---------- 50% WALLET + 5x ----------
+    # ---------- SIZE ----------
     position_value = bal * POSITION_PCT
     exposure = position_value * LEVERAGE
-    size = exposure / p
-    size = round(size, 1)
+    size = round(exposure / p, 1)
 
-    # ---------- SL / TP ----------
+    # ---------- SL/TP ----------
     sl = min(closes[-5:]) if side=="buy" else max(closes[-5:])
     risk = abs(p - sl)
-
     if risk == 0:
         return "Invalid SL"
 
@@ -178,31 +218,44 @@ def run():
 
     o = order(side, size)
     if o.get("code") != "0":
+        send_telegram("❌ ORDER FAILED")
         return "Order failed"
 
+    # SAVE
     s.update({
         "pos":side,
         "entry":p,
         "sl":sl,
         "tp":tp,
-        "size":size,
-        "last_trade":time.time()
+        "size":size
     })
     save(s)
 
-    return f"{side.upper()} | Entry:{p} SL:{sl} TP:{tp}"
+    # ALERT
+    msg = f"""
+🚀 TRADE OPENED
+Pair: {SYMBOL}
+Side: {side.upper()}
+Entry: {p}
+SL: {sl}
+TP: {tp}
+Size: {size}
+"""
+    send_telegram(msg)
 
-# ---------- LOOP ----------
+    return "Trade Opened"
+
+# ---------- MAIN ----------
 def main():
-    print("BOT STARTED (50% + 5x MODE)")
-    set_leverage()   # ✅ IMPORTANT
+    print("BOT STARTED (FINAL VERSION)")
+    set_leverage()
 
     while True:
         try:
             print(datetime.utcnow(), run())
             time.sleep(60)
         except Exception as e:
-            print("ERROR:", e)
+            send_telegram(f"⚠️ BOT ERROR: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
