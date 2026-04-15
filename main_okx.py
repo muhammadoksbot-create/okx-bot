@@ -1,10 +1,4 @@
-import requests
-import hmac
-import base64
-import json
-import os
-import math
-import time
+import requests, hmac, base64, json, os, math, time
 from datetime import datetime
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
@@ -13,326 +7,203 @@ STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 5            # 5x leverage
-POSITION_PCT = 0.50     # Wallet ka 50%
 
-# ---------- SIGN ----------
-def sign(message, secret_key):
+LEVERAGE = 5
+POSITION_PCT = 0.50   # ✅ 50% wallet
+
+# ---------- AUTH ----------
+def sign(message):
     return base64.b64encode(
-        hmac.new(secret_key.encode(), message.encode(), digestmod="sha256").digest()
+        hmac.new(SECRET_KEY.encode(), message.encode(), digestmod="sha256").digest()
     ).decode()
 
-# ---------- HEADERS ----------
-def get_headers(method, path, body=""):
-    timestamp = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
-    message = timestamp + method + path + body
-    signature = sign(message, SECRET_KEY)
-
+def headers(method, path, body=""):
+    ts = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
+    msg = ts + method + path + body
     return {
         "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-SIGN": sign(msg),
+        "OK-ACCESS-TIMESTAMP": ts,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-# ---------- STATE ----------
-def default_state():
-    return {"position": None, "entry": None, "tp": None, "sl": None, "size": None}
+# ---------- SAFE REQUEST ----------
+def req(method, path, body=None):
+    try:
+        url = BASE_URL + path
+        h = headers(method, path, body if body else "")
+        if method == "GET":
+            return requests.get(url, headers=h, timeout=10).json()
+        return requests.post(url, headers=h, data=body, timeout=10).json()
+    except Exception as e:
+        print("API ERROR:", e)
+        return {}
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return default_state()
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-# ---------- API ----------
-def get_candles(symbol, interval, limit=200):
-    path = f"/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
-    return requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
-def get_ticker(symbol):
-    path = f"/api/v5/market/ticker?instId={symbol}"
-    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-    if r.get("code") == "0" and r.get("data"):
-        d = r["data"][0]
-        return float(d.get("markPx", d.get("last", 0)))
-    return None
-
-def place_market_order(symbol, side, size):
-    path = "/api/v5/trade/order"
+# ---------- SET LEVERAGE ----------
+def set_leverage():
     body = json.dumps({
-        "instId": symbol,
-        "tdMode": "cross",
-        "side": side,
-        "ordType": "market",
-        "sz": str(size)
+        "instId": SYMBOL,
+        "lever": str(LEVERAGE),
+        "mgnMode": "cross"
     })
-    return requests.post(BASE_URL + path, headers=get_headers("POST", path, body), data=body).json()
+    req("POST", "/api/v5/account/set-leverage", body)
 
-def close_position(symbol, side, size):
-    opposite = "sell" if side == "long" else "buy"
-    return place_market_order(symbol, opposite, size)
+# ---------- STATE ----------
+def load():
+    if not os.path.exists(STATE_FILE):
+        return {"pos": None}
+    return json.load(open(STATE_FILE))
 
-def get_open_position(symbol):
-    path = "/api/v5/account/positions"
-    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-    if r.get("code") != "0":
+def save(s):
+    json.dump(s, open(STATE_FILE, "w"))
+
+# ---------- DATA ----------
+def candles():
+    r = req("GET", f"/api/v5/market/candles?instId={SYMBOL}&bar={INTERVAL}&limit=200")
+    return list(reversed(r["data"])) if r.get("code") == "0" else []
+
+def price():
+    r = req("GET", f"/api/v5/market/ticker?instId={SYMBOL}")
+    try:
+        return float(r["data"][0]["last"])
+    except:
         return None
-    for p in r["data"]:
-        if p["instId"] == symbol and float(p["pos"]) != 0:
-            return {
-                "position": "long" if float(p["pos"]) > 0 else "short",
-                "entry": float(p["avgPx"]),
-                "size": abs(float(p["pos"]))
-            }
-    return None
 
-def get_usdt_balance():
-    path = "/api/v5/account/balance"
-    r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-    if r.get("code") != "0":
+def balance():
+    r = req("GET", "/api/v5/account/balance")
+    try:
+        for d in r["data"][0]["details"]:
+            if d["ccy"] == "USDT":
+                return float(d["availBal"])
+    except:
         return None
-    for d in r["data"][0]["details"]:
-        if d["ccy"] == "USDT":
-            return float(d.get("availBal", d.get("eq", 0)))
-    return None
-    # ---------- SMC HELPERS ----------
-def find_swings(closes, lookback=3):
-    swings = []
-    n = len(closes)
-    for i in range(lookback, n - lookback):
-        high = closes[i]
-        low = closes[i]
-        is_high = all(high >= closes[i - j] and high >= closes[i + j] for j in range(1, lookback + 1))
-        is_low = all(low <= closes[i - j] and low <= closes[i + j] for j in range(1, lookback + 1))
-        if is_high:
-            swings.append(("HH", i, closes[i]))
-        if is_low:
-            swings.append(("LL", i, closes[i]))
-    return swings
 
-def detect_structure(swings):
-    if len(swings) < 3:
-        return None
-    last, prev, prev2 = swings[-1], swings[-2], swings[-3]
-    if prev[0] == "LL" and last[0] == "HH" and last[2] > prev2[2]:
-        return "BOS_UP"
-    if prev[0] == "HH" and last[0] == "LL" and last[2] < prev2[2]:
-        return "BOS_DOWN"
-    return None
+# ---------- SMC ----------
+def swings(closes, lb=3):
+    s=[]
+    for i in range(lb, len(closes)-lb):
+        if all(closes[i]>closes[i-j] and closes[i]>closes[i+j] for j in range(1,lb+1)):
+            s.append(("H",i,closes[i]))
+        if all(closes[i]<closes[i-j] and closes[i]<closes[i+j] for j in range(1,lb+1)):
+            s.append(("L",i,closes[i]))
+    return s
 
-def detect_choch(swings):
-    if len(swings) < 4:
-        return None
-    last, prev, prev2, prev3 = swings[-1], swings[-2], swings[-3], swings[-4]
-    if prev3[0] == "HH" and prev[0] == "LL" and last[2] < prev2[2]:
-        return "CHoCH_DOWN"
-    if prev3[0] == "LL" and prev[0] == "HH" and last[2] > prev2[2]:
-        return "CHoCH_UP"
-    return None
+def structure(sw):
+    if len(sw)<3: return None
+    a,b,c = sw[-3:]
+    if b[0]=="L" and c[0]=="H" and c[2]>a[2]: return "BOS_UP"
+    if b[0]=="H" and c[0]=="L" and c[2]<a[2]: return "BOS_DOWN"
 
-def detect_liquidity_sweep(candles, side="long"):
-    if len(candles) < 3:
-        return False
-    last, prev = candles[-1], candles[-2]
-    if side == "long":
-        return float(last[3]) < float(prev[3])
-    return float(last[2]) > float(prev[2])
+def choch(sw):
+    if len(sw)<4: return None
+    a,b,c,d = sw[-4:]
+    if a[0]=="H" and c[0]=="L" and d[2]<b[2]: return "SHORT"
+    if a[0]=="L" and c[0]=="H" and d[2]>b[2]: return "LONG"
 
-def detect_order_block(candles, side="long"):
-    if len(candles) < 5:
-        return None
-    for c in candles[-5:]:
-        if side == "long" and float(c[4]) < float(c[1]):
-            return (float(c[3]), float(c[2]))
-        if side == "short" and float(c[4]) > float(c[1]):
-            return (float(c[3]), float(c[2]))
-    return None
+def fvg(c):
+    if len(c)<3: return None
+    a,b,c3 = c[-3],c[-2],c[-1]
+    if float(c3[3])>float(a[2]):
+        return ("bull", float(a[2]), float(c3[3]))
+    if float(c3[2])<float(a[3]):
+        return ("bear", float(c3[2]), float(a[3]))
 
-def detect_fvg(candles):
-    if len(candles) < 3:
-        return None
-    c1, _, c3 = candles[-3], candles[-2], candles[-1]
-    if float(c3[3]) > float(c1[2]):
-        return ("bull", float(c1[2]), float(c3[3]))
-    if float(c3[2]) < float(c1[3]):
-        return ("bear", float(c3[2]), float(c1[3]))
-    return None
+def liquidity(c):
+    last, prev = c[-1], c[-2]
+    return float(last[2])>float(prev[2]) or float(last[3])<float(prev[3])
+
+# ---------- ORDER ----------
+def order(side, size):
+    body=json.dumps({
+        "instId":SYMBOL,
+        "tdMode":"cross",
+        "side":side,
+        "ordType":"market",
+        "sz":str(size)
+    })
+    return req("POST","/api/v5/trade/order",body)
 
 # ---------- CORE ----------
-def run_cycle(symbol, interval):
-    state = load_state()
+def run():
+    s = load()
+    c = candles()
+    if not c: return "No data"
 
-    data = get_candles(symbol, interval)
-    if data.get("code") != "0":
-        return {"status": "Candle error"}
+    closes = [float(x[4]) for x in c]
+    p = price()
+    if not p: return "No price"
 
-    candles = list(reversed(data["data"]))
-    closes = [float(c[4]) for c in candles]
+    # cooldown
+    if s.get("last_trade") and time.time() - s["last_trade"] < 300:
+        return "Cooldown"
 
-    price = get_ticker(symbol)
-    if price is None:
-        return {"status": "Price error"}
+    sw = swings(closes)
+    st = structure(sw)
+    ch = choch(sw)
+    fv = fvg(c)
+    liq = liquidity(c)
 
-    # Sync with exchange
-    # ---------- AUTO REBUILD TP/SL AFTER RESTART ----------
-    if exch_pos:
-        entry = exch_pos["entry"]
-        size = exch_pos["size"]
-        pos_side = exch_pos["position"]
+    side=None
 
-        SL_PCT = 0.005
-        TP_PCT = 0.01
+    if ch=="LONG" and liq:
+        side="buy"
+    elif ch=="SHORT" and liq:
+        side="sell"
+    elif st=="BOS_UP" and fv and fv[0]=="bull":
+        side="buy"
+    elif st=="BOS_DOWN" and fv and fv[0]=="bear":
+        side="sell"
 
-        # If TP/SL missing → rebuild them
-        if state["tp"] is None or state["sl"] is None:
+    if not side:
+        return "No setup"
 
-            if pos_side == "long":
-                sl = entry * (1 - SL_PCT)
-                tp = entry * (1 + TP_PCT)
-            else:
-                sl = entry * (1 + SL_PCT)
-                tp = entry * (1 - TP_PCT)
+    bal = balance()
+    if not bal: return "No balance"
 
-            state.update({
-                "position": pos_side,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "size": size
-            })
-            save_state(state)
-
-            print("\n--- TP/SL AUTO-REBUILT AFTER RESTART ---")
-            print("Side:", pos_side)
-            print("Entry:", entry)
-            print("TP:", tp)
-            print("SL:", sl)
-            print("Size:", size)
-            print("-----------------------------------------\n")
-
-    # ---------- PRINT CURRENT POSITION ----------
-    if state["position"]:
-        print("\n--- CURRENT OPEN POSITION ---")
-        print("Side:", state["position"])
-        print("Entry:", state["entry"])
-        print("TP:", state["tp"])
-        print("SL:", state["sl"])
-        print("Size:", state["size"])
-        print("-----------------------------\n")
-
-        pos = state["position"]
-        entry = state["entry"]
-        tp = state["tp"]
-        sl = state["sl"]
-        size = state["size"]
-
-        if pos == "long":
-            if price >= tp:
-                close_position(symbol, pos, size)
-                save_state(default_state())
-                return {"status": "LONG TP HIT"}
-            if price <= sl:
-                close_position(symbol, pos, size)
-                save_state(default_state())
-                return {"status": "LONG SL HIT"}
-
-        if pos == "short":
-            if price <= tp:
-                close_position(symbol, pos, size)
-                save_state(default_state())
-                return {"status": "SHORT TP HIT"}
-            if price >= sl:
-                close_position(symbol, pos, size)
-                save_state(default_state())
-                return {"status": "SHORT SL HIT"}
-
-        return {"status": f"{pos} open"}
-
-    # ---------- SMC LOGIC ----------
-    swings = find_swings(closes)
-    structure = detect_structure(swings)
-    choch = detect_choch(swings)
-    fvg = detect_fvg(candles)
-
-    side = None
-    reason = None
-
-    if choch == "CHoCH_UP" and detect_liquidity_sweep(candles, "long"):
-        side, reason = "buy", "SMC_REVERSAL_LONG"
-
-    if choch == "CHoCH_DOWN" and detect_liquidity_sweep(candles, "short"):
-        side, reason = "sell", "SMC_REVERSAL_SHORT"
-
-    if side is None and structure == "BOS_UP" and fvg and fvg[0] == "bull":
-        side, reason = "buy", "SMC_CONTINUATION_LONG"
-
-    if side is None and structure == "BOS_DOWN" and fvg and fvg[0] == "bear":
-        side, reason = "sell", "SMC_CONTINUATION_SHORT"
-
-    if side is None:
-        return {"status": "No SMC signal"}
-
-    # ---------- POSITION SIZE ----------
-    balance = get_usdt_balance()
-    if balance is None:
-        return {"status": "Balance error"}
-
-    position_value = balance * POSITION_PCT
+    # ---------- 50% WALLET + 5x ----------
+    position_value = bal * POSITION_PCT
     exposure = position_value * LEVERAGE
-    size = exposure / price
+    size = exposure / p
+    size = round(size, 1)
 
-    size = math.floor(size * 10) / 10.0   # LOT SIZE FIX
+    # ---------- SL / TP ----------
+    sl = min(closes[-5:]) if side=="buy" else max(closes[-5:])
+    risk = abs(p - sl)
 
-    order = place_market_order(symbol, side, size)
-    if order.get("code") != "0":
-        return {"status": "ORDER FAILED", "order": order}
+    if risk == 0:
+        return "Invalid SL"
 
-    exch_after = get_open_position(symbol)
-    if not exch_after:
-        return {"status": "ENTRY FAILED"}
+    tp = p + (risk * 2) if side=="buy" else p - (risk * 2)
 
-    entry = exch_after["entry"]
-    size = exch_after["size"]
+    o = order(side, size)
+    if o.get("code") != "0":
+        return "Order failed"
 
-    SL_PCT = 0.005
-    TP_PCT = 0.01
+    s.update({
+        "pos":side,
+        "entry":p,
+        "sl":sl,
+        "tp":tp,
+        "size":size,
+        "last_trade":time.time()
+    })
+    save(s)
 
-    if side == "buy":
-        sl = entry * (1 - SL_PCT)
-        tp = entry * (1 + TP_PCT)
-        pos_side = "long"
-    else:
-        sl = entry * (1 + SL_PCT)
-        tp = entry * (1 - TP_PCT)
-        pos_side = "short"
+    return f"{side.upper()} | Entry:{p} SL:{sl} TP:{tp}"
 
-    state.update({"position": pos_side, "entry": entry, "tp": tp, "sl": sl, "size": size})
-    save_state(state)
-
-    print("\n--- NEW TRADE OPENED ---")
-    print("Side:", pos_side)
-    print("Entry:", entry)
-    print("TP:", tp)
-    print("SL:", sl)
-    print("Size:", size)
-    print("Reason:", reason)
-    print("-------------------------\n")
-
-    return {"status": f"{pos_side} opened ({reason})"}
-
-# ---------- MAIN ----------
+# ---------- LOOP ----------
 def main():
-    print(f"Bot started on {SYMBOL}, interval={INTERVAL}, lev={LEVERAGE}x")
+    print("BOT STARTED (50% + 5x MODE)")
+    set_leverage()   # ✅ IMPORTANT
+
     while True:
-        info = run_cycle(SYMBOL, INTERVAL)
-        print(datetime.utcnow().isoformat(), info)
-        time.sleep(60)
+        try:
+            print(datetime.utcnow(), run())
+            time.sleep(60)
+        except Exception as e:
+            print("ERROR:", e)
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
