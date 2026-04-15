@@ -18,9 +18,13 @@ STATE_FILE   = "state_okx.json"
 SYMBOL       = "LINK-USDT-SWAP"
 INTERVAL     = "5m"
 LEVERAGE     = 5
-POSITION_PCT = 0.50          # Wallet ka 50%
+POSITION_PCT = 0.50          # Wallet ka 50% (ATR SL wide hai toh 30-40% recommended)
 SWING_LB     = 3             # Swing lookback bars
-RR_RATIO     = 2.0           # Risk:Reward 1:2
+RR_RATIO     = 1.5           # Risk:Reward 1:1.5 (changed from 2.0)
+
+# ATR Settings
+ATR_PERIOD   = 14
+ATR_MULTIPLIER = 2.0         # SL distance = 2 * ATR
 
 # 🔔 TELEGRAM  (apna token aur chat id dalo)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
@@ -248,6 +252,25 @@ def detect_liquidity(candles: list) -> bool:
 
 
 # ============================================================
+#                    ATR CALCULATION (NEW)
+# ============================================================
+def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
+    """Calculate Average True Range"""
+    if len(candles) < period + 1:
+        return 0.0
+    tr_values = []
+    for i in range(1, len(candles)):
+        high = float(candles[i][2])
+        low = float(candles[i][3])
+        prev_close = float(candles[i-1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_values.append(tr)
+    if not tr_values:
+        return 0.0
+    return sum(tr_values[-period:]) / period
+
+
+# ============================================================
 #                    ORDER PLACEMENT (FIXED)
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
@@ -440,26 +463,27 @@ def run():
         log("SIZE", f"❌ Notional value ${notional:.2f} < $10 minimum.")
         return "Size too small"
 
-    # ---- SL/TP with minimum distance protection ----
-    min_sl_distance = p * 0.002   # 0.2%
-    lookback = closes[-10:]
+    # ===========================================================
+    #  NEW: ATR-BASED STOP LOSS (VOLATILITY ADJUSTED)
+    # ===========================================================
+    atr = calc_atr(candles)
+    if atr <= 0:
+        atr = p * 0.005  # fallback 0.5%
+    
+    sl_distance = atr * ATR_MULTIPLIER
+    min_sl_distance = p * 0.002  # still enforce 0.2% minimum
+    
+    if sl_distance < min_sl_distance:
+        sl_distance = min_sl_distance
 
     if side == "buy":
-        raw_sl = min(lookback) * 0.999
-        if p - raw_sl < min_sl_distance:
-            sl = p - min_sl_distance
-        else:
-            sl = raw_sl
-        tp = p + (abs(p - sl) * RR_RATIO)
+        sl = p - sl_distance
+        tp = p + (sl_distance * RR_RATIO)
     else:
-        raw_sl = max(lookback) * 1.001
-        if raw_sl - p < min_sl_distance:
-            sl = p + min_sl_distance
-        else:
-            sl = raw_sl
-        tp = p - (abs(p - sl) * RR_RATIO)
+        sl = p + sl_distance
+        tp = p - (sl_distance * RR_RATIO)
 
-    risk_usdt = abs(p - sl) * size * ct_val
+    risk_usdt = sl_distance * size * ct_val
     if risk_usdt <= 0:
         return "Invalid risk"
 
@@ -495,8 +519,8 @@ def run():
 Direction  : {direction_emoji}
 Reason     : {reason}
 Entry      : {p:.4f} USDT
-Stop Loss  : {sl:.4f} USDT
-Take Profit: {tp:.4f} USDT
+Stop Loss  : {sl:.4f} USDT  (ATR: {atr:.4f}, Multi: {ATR_MULTIPLIER})
+Take Profit: {tp:.4f} USDT  (RR 1:{RR_RATIO})
 Size       : {size} contracts
 Leverage   : {LEVERAGE}x
 Risk       : {risk_usdt:.2f} USDT
@@ -514,15 +538,17 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  OKX SMC BOT — STARTED")
+    log("BOT", "  OKX SMC BOT — STARTED (ATR SL Enabled)")
     log("BOT", f"  Pair     : {SYMBOL}")
     log("BOT", f"  Interval : {INTERVAL}")
     log("BOT", f"  Leverage : {LEVERAGE}x")
     log("BOT", f"  Position : {int(POSITION_PCT*100)}% of balance")
+    log("BOT", f"  SL Type  : ATR({ATR_PERIOD}) * {ATR_MULTIPLIER}")
+    log("BOT", f"  RR Ratio : 1:{RR_RATIO}")
     log("BOT", "="*50)
 
     set_leverage()
-    send_telegram(f"🤖 OKX SMC Bot Started\nPair: {SYMBOL} | {LEVERAGE}x | {int(POSITION_PCT*100)}% balance")
+    send_telegram(f"🤖 OKX SMC Bot Started\nPair: {SYMBOL} | {LEVERAGE}x | ATR SL | RR 1:{RR_RATIO}")
 
     while True:
         try:
