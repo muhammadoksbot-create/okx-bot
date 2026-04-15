@@ -1,4 +1,4 @@
-import requests
+ import requests
 import hmac
 import base64
 import json
@@ -13,8 +13,8 @@ STATE_FILE = "state_okx.json"
 
 SYMBOL = "LINK-USDT-SWAP"
 INTERVAL = "5m"
-LEVERAGE = 5           # 5x leverage (exchange bhi 5x tak hi allow kar raha hai)
-POSITION_PCT = 0.10    # Wallet ka 10%
+LEVERAGE = 5            # 5x leverage
+POSITION_PCT = 0.50     # Wallet ka 50%
 
 # ---------- SIGN ----------
 def sign(message, secret_key):
@@ -33,19 +33,13 @@ def get_headers(method, path, body=""):
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json",
-       
+        "Content-Type": "application/json"
+        # LIVE mode — simulation header removed
     }
 
 # ---------- STATE ----------
 def default_state():
-    return {
-        "position": None,
-        "entry": None,
-        "tp": None,
-        "sl": None,
-        "size": None
-    }
+    return {"position": None, "entry": None, "tp": None, "sl": None, "size": None}
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -65,15 +59,9 @@ def get_candles(symbol, interval, limit=200):
 def get_ticker(symbol):
     path = f"/api/v5/market/ticker?instId={symbol}"
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
-
     if r.get("code") == "0" and r.get("data"):
         d = r["data"][0]
-        if "markPx" in d:
-            return float(d["markPx"])
-        elif "last" in d:
-            return float(d["last"])
-        else:
-            return None
+        return float(d.get("markPx", d.get("last", 0)))
     return None
 
 def place_market_order(symbol, side, size):
@@ -96,7 +84,6 @@ def get_open_position(symbol):
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") != "0":
         return None
-
     for p in r["data"]:
         if p["instId"] == symbol and float(p["pos"]) != 0:
             return {
@@ -111,7 +98,6 @@ def get_usdt_balance():
     r = requests.get(BASE_URL + path, headers=get_headers("GET", path)).json()
     if r.get("code") != "0":
         return None
-
     for d in r["data"][0]["details"]:
         if d["ccy"] == "USDT":
             return float(d.get("availBal", d.get("eq", 0)))
@@ -135,10 +121,7 @@ def find_swings(closes, lookback=3):
 def detect_structure(swings):
     if len(swings) < 3:
         return None
-    last = swings[-1]
-    prev = swings[-2]
-    prev2 = swings[-3]
-
+    last, prev, prev2 = swings[-1], swings[-2], swings[-3]
     if prev[0] == "LL" and last[0] == "HH" and last[2] > prev2[2]:
         return "BOS_UP"
     if prev[0] == "HH" and last[0] == "LL" and last[2] < prev2[2]:
@@ -148,11 +131,7 @@ def detect_structure(swings):
 def detect_choch(swings):
     if len(swings) < 4:
         return None
-    last = swings[-1]
-    prev = swings[-2]
-    prev2 = swings[-3]
-    prev3 = swings[-4]
-
+    last, prev, prev2, prev3 = swings[-1], swings[-2], swings[-3], swings[-4]
     if prev3[0] == "HH" and prev[0] == "LL" and last[2] < prev2[2]:
         return "CHoCH_DOWN"
     if prev3[0] == "LL" and prev[0] == "HH" and last[2] > prev2[2]:
@@ -162,46 +141,29 @@ def detect_choch(swings):
 def detect_liquidity_sweep(candles, side="long"):
     if len(candles) < 3:
         return False
-    last = candles[-1]
-    prev = candles[-2]
-
-    high_last = float(last[2])
-    low_last = float(last[3])
-    high_prev = float(prev[2])
-    low_prev = float(prev[3])
-
+    last, prev = candles[-1], candles[-2]
     if side == "long":
-        return low_last < low_prev
-    else:
-        return high_last > high_prev
+        return float(last[3]) < float(prev[3])
+    return float(last[2]) > float(prev[2])
 
 def detect_order_block(candles, side="long"):
     if len(candles) < 5:
         return None
-    last5 = candles[-5:]
-    if side == "long":
-        for c in last5:
-            if float(c[4]) < float(c[1]):
-                return (float(c[3]), float(c[2]))
-    else:
-        for c in last5:
-            if float(c[4]) > float(c[1]):
-                return (float(c[3]), float(c[2]))
+    for c in candles[-5:]:
+        if side == "long" and float(c[4]) < float(c[1]):
+            return (float(c[3]), float(c[2]))
+        if side == "short" and float(c[4]) > float(c[1]):
+            return (float(c[3]), float(c[2]))
     return None
 
 def detect_fvg(candles):
     if len(candles) < 3:
         return None
-    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    high1 = float(c1[2])
-    low1 = float(c1[3])
-    high3 = float(c3[2])
-    low3 = float(c3[3])
-
-    if low3 > high1:
-        return ("bull", high1, low3)
-    if high3 < low1:
-        return ("bear", high3, low1)
+    c1, _, c3 = candles[-3], candles[-2], candles[-1]
+    if float(c3[3]) > float(c1[2]):
+        return ("bull", float(c1[2]), float(c3[3]))
+    if float(c3[2]) < float(c1[3]):
+        return ("bear", float(c3[2]), float(c1[3]))
     return None
 
 # ---------- CORE ----------
@@ -219,7 +181,6 @@ def run_cycle(symbol, interval):
     if price is None:
         return {"status": "Price error"}
 
-    # Sync with exchange
     exch_pos = get_open_position(symbol)
     if exch_pos:
         state.update(exch_pos)
@@ -228,43 +189,30 @@ def run_cycle(symbol, interval):
         state = default_state()
         save_state(state)
 
-    # Manage open position
     if state["position"]:
-        pos = state["position"]
-        entry = state["entry"]
-        tp = state["tp"]
-        sl = state["sl"]
-        size = state["size"]
-
+        pos, entry, tp, sl, size = state.values()
         if pos == "long":
             if price >= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "LONG TP HIT"}
             if price <= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "LONG SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "LONG SL HIT"}
 
         if pos == "short":
             if price <= tp:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT TP HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "SHORT TP HIT"}
             if price >= sl:
                 close_position(symbol, pos, size)
                 save_state(default_state())
-                return {"status": "SHORT SL HIT", "entry": entry, "tp": tp, "sl": sl, "size": size}
+                return {"status": "SHORT SL HIT"}
 
-        return {
-            "status": f"{pos} open",
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "size": size
-        }
+        return {"status": f"{pos} open"}
 
-    # SMC Logic
     swings = find_swings(closes)
     structure = detect_structure(swings)
     choch = detect_choch(swings)
@@ -273,39 +221,30 @@ def run_cycle(symbol, interval):
     side = None
     reason = None
 
-    if choch == "CHoCH_UP":
-        if detect_liquidity_sweep(candles, "long"):
-            ob = detect_order_block(candles, "long")
-            side = "buy"
-            reason = "SMC_REVERSAL_LONG"
+    if choch == "CHoCH_UP" and detect_liquidity_sweep(candles, "long"):
+        side, reason = "buy", "SMC_REVERSAL_LONG"
 
-    if choch == "CHoCH_DOWN":
-        if detect_liquidity_sweep(candles, "short"):
-            ob = detect_order_block(candles, "short")
-            side = "sell"
-            reason = "SMC_REVERSAL_SHORT"
+    if choch == "CHoCH_DOWN" and detect_liquidity_sweep(candles, "short"):
+        side, reason = "sell", "SMC_REVERSAL_SHORT"
 
     if side is None and structure == "BOS_UP" and fvg and fvg[0] == "bull":
-        side = "buy"
-        reason = "SMC_CONTINUATION_LONG"
+        side, reason = "buy", "SMC_CONTINUATION_LONG"
 
     if side is None and structure == "BOS_DOWN" and fvg and fvg[0] == "bear":
-        side = "sell"
-        reason = "SMC_CONTINUATION_SHORT"
+        side, reason = "sell", "SMC_CONTINUATION_SHORT"
 
     if side is None:
-        return {"status": "No SMC signal", "structure": structure, "choch": choch}
+        return {"status": "No SMC signal"}
 
-    # ---------- POSITION SIZE = WALLET KA 10% ----------
     balance = get_usdt_balance()
     if balance is None:
         return {"status": "Balance error"}
 
-    position_value = balance * POSITION_PCT      # wallet ka 10%
-    exposure = position_value * LEVERAGE         # 5x
-    size = exposure / price                      # coin size
+    position_value = balance * POSITION_PCT
+    exposure = position_value * LEVERAGE
+    size = exposure / price
 
-    size = round(size, 2)
+    size = math.floor(size * 10) / 10.0   # LOT SIZE FIX (0.1 step)
 
     order = place_market_order(symbol, side, size)
     if order.get("code") != "0":
@@ -318,9 +257,8 @@ def run_cycle(symbol, interval):
     entry = exch_after["entry"]
     size = exch_after["size"]
 
-    # ---------- SL / TP (1:2 RR) ----------
-    SL_PCT = 0.005   # 0.5%
-    TP_PCT = 0.01    # 1%
+    SL_PCT = 0.005
+    TP_PCT = 0.01
 
     if side == "buy":
         sl = entry * (1 - SL_PCT)
@@ -331,27 +269,14 @@ def run_cycle(symbol, interval):
         tp = entry * (1 - TP_PCT)
         pos_side = "short"
 
-    state.update({
-        "position": pos_side,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "size": size
-    })
+    state.update({"position": pos_side, "entry": entry, "tp": tp, "sl": sl, "size": size})
     save_state(state)
 
-    return {
-        "status": f"{pos_side} opened ({reason})",
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "size": size
-    }
+    return {"status": f"{pos_side} opened ({reason})"}
 
 # ---------- MAIN ----------
 def main():
     print(f"Bot started on {SYMBOL}, interval={INTERVAL}, lev={LEVERAGE}x")
-
     while True:
         info = run_cycle(SYMBOL, INTERVAL)
         print(datetime.utcnow().isoformat(), info)
