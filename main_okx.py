@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import time
+import math                           # ✅ FIXED: Imported at top
 from datetime import datetime, timezone
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
@@ -38,6 +39,9 @@ def log(tag: str, msg: str):
 # ============================================================
 #                    TELEGRAM
 # ============================================================
+TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"   # <--- APNA TOKEN YAHAN DALO
+CHAT_ID        = "1118069943"     # <--- APNI CHAT ID YAHAN DALO
+
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -46,8 +50,7 @@ def send_telegram(msg: str):
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         log("TG_ERR", str(e))
-
-
+        
 # ============================================================
 #                    AUTH  (BUG FIX: hashlib.sha256)
 # ============================================================
@@ -170,7 +173,7 @@ def get_balance() -> float | None:
 
 
 # ============================================================
-#           REAL POSITION SYNC  (OKX se actual check)  ✅ NEW
+#           REAL POSITION SYNC  (OKX se actual check)
 # ============================================================
 def get_open_position() -> dict | None:
     """
@@ -270,17 +273,26 @@ def detect_fvg(candles: list) -> tuple | None:
     return None
 
 
-# ------ Liquidity Sweep ------
+# ------ Liquidity Sweep (Improved) ------
 def detect_liquidity(candles: list) -> bool:
     """
     Wick ne previous candle ki extreme cross ki — sweep signal.
+    Proper sweep: price breaks structure and immediately reverses.
     """
     if len(candles) < 2:
         return False
     last = candles[-1]
     prev = candles[-2]
-    swept_high = float(last[2]) > float(prev[2])   # Sell-side liq
-    swept_low  = float(last[3]) < float(prev[3])   # Buy-side liq
+    last_high = float(last[2])
+    last_low  = float(last[3])
+    prev_high = float(prev[2])
+    prev_low  = float(prev[3])
+    last_close = float(last[4])
+
+    # Sell-side liquidity sweep: wick above prev high but closed below it
+    swept_high = (last_high > prev_high) and (last_close < prev_high)
+    # Buy-side liquidity sweep: wick below prev low but closed above it
+    swept_low  = (last_low < prev_low)   and (last_close > prev_low)
     return swept_high or swept_low
 
 
@@ -290,8 +302,7 @@ def detect_liquidity(candles: list) -> bool:
 
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     """
-    Market order + Exchange pe attached TP/SL algo order.  ✅ NEW
-    OKX attachAlgoOrds se ek hi call mein TP/SL set ho jata hai.
+    Market order + Exchange pe attached TP/SL algo order.
     """
     tp_str = str(round(tp, 4))
     sl_str = str(round(sl, 4))
@@ -330,7 +341,7 @@ def close_position(side: str, size: float) -> dict:
 
 
 # ============================================================
-#                    TRADE DETAILS DISPLAY  ✅ NEW
+#                    TRADE DETAILS DISPLAY
 # ============================================================
 def print_trade_details(action: str, side: str, entry: float,
                         sl: float, tp: float, size: float,
@@ -374,7 +385,7 @@ def run():
     closes = [float(x[4]) for x in candles]
 
     # ===========================================================
-    #  POSITION CHECK — OKX se actual sync  ✅ NEW
+    #  POSITION CHECK — OKX se actual sync
     # ===========================================================
     actual_pos = get_open_position()
 
@@ -387,6 +398,20 @@ def run():
             state["size"]  = abs(float(actual_pos["pos"]))
             state["entry"] = float(actual_pos.get("avgPx", p))
             save_state(state)
+
+        # ====== ✨ NEW: Reverse Signal Exit Check ======
+        swings = find_swings(closes)
+        choch  = detect_choch(swings)
+        if state.get("pos"):
+            if (state["pos"] == "buy" and choch == "SHORT") or (state["pos"] == "sell" and choch == "LONG"):
+                log("SIGNAL", f"🔁 Reverse CHoCH ({choch}) detected, closing position")
+                close_res = close_position(state["pos"], state["size"])
+                if close_res.get("code") == "0":
+                    log("EXIT", "✅ Position closed due to reversal")
+                    save_state({"pos": None})
+                    send_telegram(f"🔁 POSITION CLOSED (Reverse Signal)\n{SYMBOL}\nCHoCH: {choch}")
+                    return "Closed on reverse signal"
+        # ================================================
 
         # TP/SL exchange pe lag chuka hai — sirf status dikhao
         entry = state.get("entry", p)
@@ -442,7 +467,7 @@ def run():
     log("SIGNAL", f"✅ Setup: {reason} → {side.upper()}")
 
     # ===========================================================
-    #  BALANCE + SIZE CALCULATION  (BUG FIX: contracts)  ✅
+    #  BALANCE + SIZE CALCULATION
     # ===========================================================
     bal = get_balance()
     if not bal:
@@ -502,7 +527,7 @@ def run():
     save_state(state)
 
     # ===========================================================
-    #  CONSOLE DETAILS  ✅
+    #  CONSOLE DETAILS
     # ===========================================================
     print_trade_details(
         action    = "🚀 TRADE OPENED",
@@ -542,8 +567,6 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 #                    ENTRY POINT
 # ============================================================
-import math   # (upar bhi use ho raha tha, yahan import ensure karo)
-
 def main():
     log("BOT", "="*50)
     log("BOT", "  OKX SMC BOT — STARTED")
