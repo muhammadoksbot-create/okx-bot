@@ -12,8 +12,8 @@ LEVERAGE = 5
 POSITION_PCT = 0.50
 
 # 🔔 TELEGRAM
-TELEGRAM_TOKEN = "YOUR_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
+CHAT_ID = "okx_trade_alert_bot"
 
 # ---------- TELEGRAM ----------
 def send_telegram(msg):
