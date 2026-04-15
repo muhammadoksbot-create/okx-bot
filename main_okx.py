@@ -180,13 +180,41 @@ def run_cycle(symbol, interval):
         return {"status": "Price error"}
 
     # Sync with exchange
-    exch_pos = get_open_position(symbol)
+    # ---------- AUTO REBUILD TP/SL AFTER RESTART ----------
     if exch_pos:
-        state.update(exch_pos)
-        save_state(state)
-    else:
-        state = default_state()
-        save_state(state)
+        entry = exch_pos["entry"]
+        size = exch_pos["size"]
+        pos_side = exch_pos["position"]
+
+        SL_PCT = 0.005
+        TP_PCT = 0.01
+
+        # If TP/SL missing → rebuild them
+        if state["tp"] is None or state["sl"] is None:
+
+            if pos_side == "long":
+                sl = entry * (1 - SL_PCT)
+                tp = entry * (1 + TP_PCT)
+            else:
+                sl = entry * (1 + SL_PCT)
+                tp = entry * (1 - TP_PCT)
+
+            state.update({
+                "position": pos_side,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "size": size
+            })
+            save_state(state)
+
+            print("\n--- TP/SL AUTO-REBUILT AFTER RESTART ---")
+            print("Side:", pos_side)
+            print("Entry:", entry)
+            print("TP:", tp)
+            print("SL:", sl)
+            print("Size:", size)
+            print("-----------------------------------------\n")
 
     # ---------- PRINT CURRENT POSITION ----------
     if state["position"]:
@@ -308,38 +336,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        # ---------- AUTO REBUILD TP/SL AFTER RESTART ----------
-    if exch_pos:
-        entry = exch_pos["entry"]
-        size = exch_pos["size"]
-        pos_side = exch_pos["position"]
-
-        SL_PCT = 0.005
-        TP_PCT = 0.01
-
-        # If TP/SL missing → rebuild them
-        if state["tp"] is None or state["sl"] is None:
-
-            if pos_side == "long":
-                sl = entry * (1 - SL_PCT)
-                tp = entry * (1 + TP_PCT)
-            else:
-                sl = entry * (1 + SL_PCT)
-                tp = entry * (1 - TP_PCT)
-
-            state.update({
-                "position": pos_side,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "size": size
-            })
-            save_state(state)
-
-            print("\n--- TP/SL AUTO-REBUILT AFTER RESTART ---")
-            print("Side:", pos_side)
-            print("Entry:", entry)
-            print("TP:", tp)
-            print("SL:", sl)
-            print("Size:", size)
-            print("-----------------------------------------\n")
