@@ -10,23 +10,21 @@ from datetime import datetime, timezone
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
 # ============================================================
-#                    CONFIGURATION
+#                    CONFIGURATION (DOGE OPTIMIZED)
 # ============================================================
 BASE_URL     = "https://www.okx.com"
 STATE_FILE   = "state_okx.json"
 
-SYMBOL       = "LINK-USDT-SWAP"
+SYMBOL       = "DOGE-USDT-SWAP"
 INTERVAL     = "5m"
 LEVERAGE     = 5
-POSITION_PCT = 0.50          # Wallet ka 50% (ATR SL wide hai toh 30-40% recommended)
+POSITION_PCT = 0.50          # Wallet ka 50%
 SWING_LB     = 3             # Swing lookback bars
-RR_RATIO     = 1.5           # Risk:Reward 1:1.5 (changed from 2.0)
-
-# ATR Settings
+RR_RATIO     = 1.5           # Risk:Reward 1:1.5
 ATR_PERIOD   = 14
-ATR_MULTIPLIER = 2.0         # SL distance = 2 * ATR
+ATR_MULTIPLIER = 5.0         # Wide SL for DOGE volatility
 
-# 🔔 TELEGRAM  (apna token aur chat id dalo)
+# 🔔 TELEGRAM (apna token aur chat id dalo)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
 CHAT_ID        = "1118069943"
 
@@ -144,7 +142,7 @@ def save_state(s: dict):
 #                    MARKET DATA
 # ============================================================
 def get_candles():
-    r = req("GET", f"/api/v5/market/candles?instId={SYMBOL}&bar={INTERVAL}&limit=200")
+    r = req("GET", f"/api/v5/market/candles?instId={SYMBOL}&bar={INTERVAL}&limit=300")
     if r.get("code") == "0":
         return list(reversed(r["data"]))
     log("DATA", "❌ Candles fetch failed")
@@ -252,10 +250,9 @@ def detect_liquidity(candles: list) -> bool:
 
 
 # ============================================================
-#                    ATR CALCULATION (NEW)
+#                    ATR CALCULATION
 # ============================================================
 def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
-    """Calculate Average True Range"""
     if len(candles) < period + 1:
         return 0.0
     tr_values = []
@@ -271,12 +268,40 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
 
 
 # ============================================================
+#                    SMART STOP LOSS (Swing Based)
+# ============================================================
+def smart_stop_loss(side: str, swings: list, current_price: float) -> float:
+    """
+    Swing highs/lows ke peeche SL chhupao.
+    """
+    if not swings:
+        return None
+    
+    if side == "buy":
+        lows = [s[2] for s in swings if s[0] == "L"]
+        if len(lows) >= 2:
+            return lows[-2] * 0.999
+        elif len(lows) == 1:
+            return lows[-1] * 0.999
+        else:
+            return current_price * 0.98   # fallback 2%
+    else:  # sell
+        highs = [s[2] for s in swings if s[0] == "H"]
+        if len(highs) >= 2:
+            return highs[-2] * 1.001
+        elif len(highs) == 1:
+            return highs[-1] * 1.001
+        else:
+            return current_price * 1.02
+
+
+# ============================================================
 #                    ORDER PLACEMENT (FIXED)
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     """
-    Step 1: Place market order.
-    Step 2: Set TP/SL using /api/v5/trade/amend-order endpoint.
+    Step 1: Market order.
+    Step 2: Algo order for TP/SL.
     """
     sz_int = int(size)
     
@@ -289,20 +314,16 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
         "sz":      str(sz_int)
     })
     
-    log("DEBUG", f"Market Payload: {body_market}")
     result = req("POST", "/api/v5/trade/order", body_market)
-    
     if result.get("code") != "0":
         log("ORDER", f"❌ Market order failed: {result}")
         send_telegram(f"❌ MARKET ORDER FAILED\n{SYMBOL}\n{result}")
         return result
     
     log("ORDER", f"✅ Market order placed.")
-    
-    # Wait 1 second for order to settle
     time.sleep(1)
     
-    # ---- Step 2: Set TP/SL using order-algo with full params ----
+    # ---- Step 2: TP/SL Algo Order ----
     algo_side = "sell" if side == "buy" else "buy"
     tp_str = str(round(tp, 4))
     sl_str = str(round(sl, 4))
@@ -317,21 +338,20 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
         "tpOrdPx":     "-1",
         "slTriggerPx": sl_str,
         "slOrdPx":     "-1",
-        "posSide":     "net",          # 🔥 Added: Explicit position side
-        "reduceOnly":  "true"          # 🔥 Added: Ensure reduce-only
+        "posSide":     "net",
+        "reduceOnly":  "true"
     })
     
-    log("DEBUG", f"Algo Payload: {body_algo}")
     algo_res = req("POST", "/api/v5/trade/order-algo", body_algo)
-    
     if algo_res.get("code") != "0":
-        log("ALGO", f"❌ TP/SL placement failed: {algo_res}")
-        send_telegram(f"⚠️ TP/SL FAILED\n{SYMBOL}\nMarket OK but Algo Failed:\n{algo_res}")
+        log("ALGO", f"❌ TP/SL failed: {algo_res}")
+        send_telegram(f"⚠️ TP/SL FAILED\n{SYMBOL}\nMarket OK, Algo Fail:\n{algo_res}")
     else:
-        log("ALGO", "✅ TP/SL algo order placed successfully")
+        log("ALGO", "✅ TP/SL set successfully")
         send_telegram(f"✅ TP/SL SET\n{SYMBOL}\nTP: {tp_str}\nSL: {sl_str}")
     
     return result
+
 
 def close_position(side: str, size: float) -> dict:
     close_side = "sell" if side == "buy" else "buy"
@@ -401,7 +421,7 @@ def run():
             state["entry"] = float(actual_pos.get("avgPx", p))
             save_state(state)
 
-        # Reverse signal exit (optional)
+        # Reverse signal exit
         swings = find_swings(closes)
         choch  = detect_choch(swings)
         if state.get("pos"):
@@ -436,23 +456,30 @@ def run():
     fvg    = detect_fvg(candles)
     liq    = detect_liquidity(candles)
 
-    log("SMC", f"BOS={bos} | CHoCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq}")
+    # Volume Filter
+    volumes = [float(c[5]) for c in candles[-20:]]
+    avg_vol = sum(volumes[:-1]) / (len(volumes) - 1) if len(volumes) > 1 else 0
+    current_vol = volumes[-1]
+    volume_surge = current_vol > avg_vol * 1.5
+
+    log("SMC", f"BOS={bos} | CHoCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq} | VolSurge={volume_surge}")
 
     side = None
     reason = ""
 
-    if choch == "LONG" and liq:
+    # Entry conditions with volume filter
+    if choch == "LONG" and liq and volume_surge:
         side = "buy"
-        reason = "CHoCH LONG + Liquidity Sweep"
-    elif choch == "SHORT" and liq:
+        reason = "CHoCH LONG + Liq + Volume"
+    elif choch == "SHORT" and liq and volume_surge:
         side = "sell"
-        reason = "CHoCH SHORT + Liquidity Sweep"
-    elif bos == "BOS_UP" and fvg and fvg[0] == "bull":
+        reason = "CHoCH SHORT + Liq + Volume"
+    elif bos == "BOS_UP" and fvg and fvg[0] == "bull" and volume_surge:
         side = "buy"
-        reason = "BOS UP + Bullish FVG"
-    elif bos == "BOS_DOWN" and fvg and fvg[0] == "bear":
+        reason = "BOS UP + Bullish FVG + Volume"
+    elif bos == "BOS_DOWN" and fvg and fvg[0] == "bear" and volume_surge:
         side = "sell"
-        reason = "BOS DOWN + Bearish FVG"
+        reason = "BOS DOWN + Bearish FVG + Volume"
 
     if not side:
         log("SIGNAL", "⏳ No SMC setup — waiting...")
@@ -479,27 +506,27 @@ def run():
         log("SIZE", f"❌ Notional value ${notional:.2f} < $10 minimum.")
         return "Size too small"
 
-    # ===========================================================
-    #  NEW: ATR-BASED STOP LOSS (VOLATILITY ADJUSTED)
-    # ===========================================================
-    atr = calc_atr(candles)
-    if atr <= 0:
-        atr = p * 0.005  # fallback 0.5%
-    
-    sl_distance = atr * ATR_MULTIPLIER
-    min_sl_distance = p * 0.002  # still enforce 0.2% minimum
-    
-    if sl_distance < min_sl_distance:
-        sl_distance = min_sl_distance
-
-    if side == "buy":
-        sl = p - sl_distance
-        tp = p + (sl_distance * RR_RATIO)
+    # ---- SMART STOP LOSS ----
+    sl = smart_stop_loss(side, swings, p)
+    if sl is None:
+        # Fallback to ATR
+        atr = calc_atr(candles)
+        sl_distance = atr * ATR_MULTIPLIER
+        if side == "buy":
+            sl = p - sl_distance
+        else:
+            sl = p + sl_distance
+        log("SL", f"Using ATR fallback SL: {sl:.4f} (ATR: {atr:.4f})")
     else:
-        sl = p + sl_distance
-        tp = p - (sl_distance * RR_RATIO)
+        log("SL", f"Using Smart SL: {sl:.4f} (swing based)")
 
-    risk_usdt = sl_distance * size * ct_val
+    # ---- TP Calculation ----
+    if side == "buy":
+        tp = p + (abs(p - sl) * RR_RATIO)
+    else:
+        tp = p - (abs(p - sl) * RR_RATIO)
+
+    risk_usdt = abs(p - sl) * size * ct_val
     if risk_usdt <= 0:
         return "Invalid risk"
 
@@ -535,7 +562,7 @@ def run():
 Direction  : {direction_emoji}
 Reason     : {reason}
 Entry      : {p:.4f} USDT
-Stop Loss  : {sl:.4f} USDT  (ATR: {atr:.4f}, Multi: {ATR_MULTIPLIER})
+Stop Loss  : {sl:.4f} USDT
 Take Profit: {tp:.4f} USDT  (RR 1:{RR_RATIO})
 Size       : {size} contracts
 Leverage   : {LEVERAGE}x
@@ -554,17 +581,18 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  OKX SMC BOT — STARTED (ATR SL Enabled)")
+    log("BOT", "  OKX SMC BOT — DOGE Optimized")
     log("BOT", f"  Pair     : {SYMBOL}")
     log("BOT", f"  Interval : {INTERVAL}")
     log("BOT", f"  Leverage : {LEVERAGE}x")
     log("BOT", f"  Position : {int(POSITION_PCT*100)}% of balance")
-    log("BOT", f"  SL Type  : ATR({ATR_PERIOD}) * {ATR_MULTIPLIER}")
+    log("BOT", f"  SL Type  : Smart Swing + ATR({ATR_PERIOD})*{ATR_MULTIPLIER}")
     log("BOT", f"  RR Ratio : 1:{RR_RATIO}")
+    log("BOT", f"  Volume Filter: ON (>1.5x avg)")
     log("BOT", "="*50)
 
     set_leverage()
-    send_telegram(f"🤖 OKX SMC Bot Started\nPair: {SYMBOL} | {LEVERAGE}x | ATR SL | RR 1:{RR_RATIO}")
+    send_telegram(f"🤖 OKX SMC Bot Started\n{SYMBOL} | {LEVERAGE}x | Smart SL | RR 1:{RR_RATIO}")
 
     while True:
         try:
