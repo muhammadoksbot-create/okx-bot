@@ -276,7 +276,7 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     """
     Step 1: Place market order.
-    Step 2: Set TP/SL using /api/v5/trade/order-algo endpoint.
+    Step 2: Set TP/SL using /api/v5/trade/amend-order endpoint.
     """
     sz_int = int(size)
     
@@ -297,24 +297,28 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
         send_telegram(f"❌ MARKET ORDER FAILED\n{SYMBOL}\n{result}")
         return result
     
-    log("ORDER", f"✅ Market order placed. Response: {result}")
+    log("ORDER", f"✅ Market order placed.")
     
-    # ---- Step 2: Set TP/SL using order-algo ----
-    # Opposite side for TP/SL
+    # Wait 1 second for order to settle
+    time.sleep(1)
+    
+    # ---- Step 2: Set TP/SL using order-algo with full params ----
     algo_side = "sell" if side == "buy" else "buy"
     tp_str = str(round(tp, 4))
     sl_str = str(round(sl, 4))
     
     body_algo = json.dumps({
-        "instId":  SYMBOL,
-        "tdMode":  "cross",
-        "side":    algo_side,
-        "ordType": "conditional",
-        "sz":      str(sz_int),
+        "instId":      SYMBOL,
+        "tdMode":      "cross",
+        "side":        algo_side,
+        "ordType":     "conditional",
+        "sz":          str(sz_int),
         "tpTriggerPx": tp_str,
         "tpOrdPx":     "-1",
         "slTriggerPx": sl_str,
-        "slOrdPx":     "-1"
+        "slOrdPx":     "-1",
+        "posSide":     "net",          # 🔥 Added: Explicit position side
+        "reduceOnly":  "true"          # 🔥 Added: Ensure reduce-only
     })
     
     log("DEBUG", f"Algo Payload: {body_algo}")
@@ -328,7 +332,6 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
         send_telegram(f"✅ TP/SL SET\n{SYMBOL}\nTP: {tp_str}\nSL: {sl_str}")
     
     return result
-
 
 def close_position(side: str, size: float) -> dict:
     close_side = "sell" if side == "buy" else "buy"
