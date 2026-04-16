@@ -275,40 +275,57 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     """
-    Single API call: Market order with attached TP/SL algo orders.
+    Step 1: Place market order.
+    Step 2: Set TP/SL using /api/v5/trade/order-algo endpoint.
     """
     sz_int = int(size)
-    tp_str = str(round(tp, 4))
-    sl_str = str(round(sl, 4))
     
-    # Unique ID sirf ek baar (OKX ek object mein dono TP/SL chahta hai)
-    algo_id = f"tp_{int(time.time() * 1000)}"
-    
-    body = json.dumps({
+    # ---- Step 1: Market Order ----
+    body_market = json.dumps({
         "instId":  SYMBOL,
         "tdMode":  "cross",
         "side":    side,
         "ordType": "market",
-        "sz":      str(sz_int),
-        "attachAlgoOrds": [
-            {
-                "attachAlgoClOrdId": algo_id,
-                "tpTriggerPx":       tp_str,
-                "tpOrdPx":           "-1",
-                "slTriggerPx":       sl_str,
-                "slOrdPx":           "-1"
-            }
-        ]
+        "sz":      str(sz_int)
     })
     
-    log("DEBUG", f"Order Payload: {body}")
-    result = req("POST", "/api/v5/trade/order", body)
+    log("DEBUG", f"Market Payload: {body_market}")
+    result = req("POST", "/api/v5/trade/order", body_market)
     
-    if result.get("code") == "0":
-        log("ORDER", "✅ Market order with TP/SL placed successfully")
+    if result.get("code") != "0":
+        log("ORDER", f"❌ Market order failed: {result}")
+        send_telegram(f"❌ MARKET ORDER FAILED\n{SYMBOL}\n{result}")
+        return result
+    
+    log("ORDER", f"✅ Market order placed. Response: {result}")
+    
+    # ---- Step 2: Set TP/SL using order-algo ----
+    # Opposite side for TP/SL
+    algo_side = "sell" if side == "buy" else "buy"
+    tp_str = str(round(tp, 4))
+    sl_str = str(round(sl, 4))
+    
+    body_algo = json.dumps({
+        "instId":  SYMBOL,
+        "tdMode":  "cross",
+        "side":    algo_side,
+        "ordType": "conditional",
+        "sz":      str(sz_int),
+        "tpTriggerPx": tp_str,
+        "tpOrdPx":     "-1",
+        "slTriggerPx": sl_str,
+        "slOrdPx":     "-1"
+    })
+    
+    log("DEBUG", f"Algo Payload: {body_algo}")
+    algo_res = req("POST", "/api/v5/trade/order-algo", body_algo)
+    
+    if algo_res.get("code") != "0":
+        log("ALGO", f"❌ TP/SL placement failed: {algo_res}")
+        send_telegram(f"⚠️ TP/SL FAILED\n{SYMBOL}\nMarket OK but Algo Failed:\n{algo_res}")
     else:
-        log("ORDER", f"❌ Order failed: {result}")
-        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{result}")
+        log("ALGO", "✅ TP/SL algo order placed successfully")
+        send_telegram(f"✅ TP/SL SET\n{SYMBOL}\nTP: {tp_str}\nSL: {sl_str}")
     
     return result
 
