@@ -10,19 +10,19 @@ from datetime import datetime, timezone
 from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
 
 # ============================================================
-#                    CONFIGURATION (DOGE OPTIMIZED)
+#                    CONFIGURATION (XRP OPTIMIZED)
 # ============================================================
 BASE_URL     = "https://www.okx.com"
 STATE_FILE   = "state_okx.json"
 
-SYMBOL       = "DOGE-USDT-SWAP"
+SYMBOL       = "XRP-USDT-SWAP"
 INTERVAL     = "5m"
 LEVERAGE     = 5
 POSITION_PCT = 0.50          # Wallet ka 50%
 SWING_LB     = 3             # Swing lookback bars
 RR_RATIO     = 1.5           # Risk:Reward 1:1.5
 ATR_PERIOD   = 14
-ATR_MULTIPLIER = 5.0         # Wide SL for DOGE volatility
+ATR_MULTIPLIER = 2.0         # XRP ki volatility moderate hai
 
 # 🔔 TELEGRAM (apna token aur chat id dalo)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
@@ -113,6 +113,9 @@ def set_leverage():
 #                    CONTRACT VALUE
 # ============================================================
 def get_ct_val() -> float:
+    # XRP-USDT-SWAP ke liye ctVal = 1
+    if "XRP" in SYMBOL:
+        return 1.0
     r = req("GET", f"/api/v5/public/instruments?instType=SWAP&instId={SYMBOL}")
     try:
         return float(r["data"][0]["ctVal"])
@@ -581,7 +584,7 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  OKX SMC BOT — DOGE Optimized")
+    log("BOT", "  OKX SMC BOT — XRP Optimized")
     log("BOT", f"  Pair     : {SYMBOL}")
     log("BOT", f"  Interval : {INTERVAL}")
     log("BOT", f"  Leverage : {LEVERAGE}x")
