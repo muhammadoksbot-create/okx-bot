@@ -6,12 +6,12 @@ import os
 import time
 import math
 from datetime import datetime, timezone
-from config_okx import API_KEY, SECRET_KEY   # ✅ Import from your existing file
+from config_okx import API_KEY, SECRET_KEY
 
 # ============================================================
-#                    CONFIGURATION (BYBIT ADAUSDT)
+#                    CONFIGURATION (UAE OPTIMIZED)
 # ============================================================
-BASE_URL     = "https://api.bybit.com"
+BASE_URL     = "https://api.bybit.ae"   # ✅ UAE ke liye sahi address
 STATE_FILE   = "state_bybit.json"
 
 SYMBOL       = "ADAUSDT"
@@ -27,8 +27,6 @@ ATR_MULTIPLIER = 2.0
 # 🔔 TELEGRAM (Optional)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
 CHAT_ID        = "1118069943"
-
-# (API_KEY aur SECRET_KEY ab config_okx se aa rahe hain, yahan define nahi karna)
 
 
 # ============================================================
@@ -72,7 +70,7 @@ def make_headers(payload: str = "") -> dict:
 
 
 # ============================================================
-#                    REQUEST HANDLER
+#                    REQUEST HANDLER (WITH DEBUG)
 # ============================================================
 def req(method: str, path: str, body: str = None):
     try:
@@ -82,6 +80,16 @@ def req(method: str, path: str, body: str = None):
             r = requests.get(url, headers=h, timeout=10)
         else:
             r = requests.post(url, headers=h, data=body, timeout=10)
+
+        # ===== DEBUG PRINT (MASLAY KI JARR DEKHNE KE LIYE) =====
+        print("\n" + "="*40)
+        print(f"🌐 URL: {url}")
+        print(f"📡 Status Code: {r.status_code}")
+        if r.status_code != 200:
+            print(f"❌ Response Text: {r.text[:300]}")
+        print("="*40 + "\n")
+        # ======================================================
+
         return r.json()
     except Exception as e:
         log("API_ERR", str(e))
@@ -454,7 +462,7 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  BYBIT SMC BOT — ADAUSDT")
+    log("BOT", "  BYBIT SMC BOT — ADAUSDT (UAE)")
     log("BOT", f"  Leverage : {LEVERAGE}x | Position: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
     log("BOT", "="*50)
     set_leverage()
