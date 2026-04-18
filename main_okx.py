@@ -1,45 +1,43 @@
 import requests
 import hmac
 import hashlib
-import base64
 import json
 import os
 import time
 import math
 from datetime import datetime, timezone
-from config_okx import API_KEY, SECRET_KEY, PASSPHRASE
+from config_okx import API_KEY, SECRET_KEY   # ✅ Import from your existing file
 
 # ============================================================
-#                    CONFIGURATION (XRP OPTIMIZED)
+#                    CONFIGURATION (BYBIT ADAUSDT)
 # ============================================================
-BASE_URL     = "https://www.okx.com"
-STATE_FILE   = "state_okx.json"
+BASE_URL     = "https://api.bybit.com"
+STATE_FILE   = "state_bybit.json"
 
-SYMBOL       = "XRP-USDT-SWAP"
-INTERVAL     = "5m"
+SYMBOL       = "ADAUSDT"
+CATEGORY     = "linear"
+INTERVAL     = "5"
 LEVERAGE     = 5
-POSITION_PCT = 0.30          # Wallet ka 30% (margin safe rahega)
-SWING_LB     = 3             # Swing lookback bars
-RR_RATIO     = 1.5           # Risk:Reward 1:1.5
+POSITION_PCT = 0.30
+SWING_LB     = 3
+RR_RATIO     = 1.5
 ATR_PERIOD   = 14
-ATR_MULTIPLIER = 2.0         # XRP ki volatility moderate hai
+ATR_MULTIPLIER = 2.0
 
-# 🔔 TELEGRAM (apna token aur chat id dalo)
+# 🔔 TELEGRAM (Optional)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
 CHAT_ID        = "1118069943"
 
+# (API_KEY aur SECRET_KEY ab config_okx se aa rahe hain, yahan define nahi karna)
+
 
 # ============================================================
-#                    LOGGING HELPER
+#                    LOGGING & TELEGRAM
 # ============================================================
 def log(tag: str, msg: str):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] [{tag}] {msg}")
 
-
-# ============================================================
-#                    TELEGRAM
-# ============================================================
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -51,37 +49,35 @@ def send_telegram(msg: str):
 
 
 # ============================================================
-#                    AUTH
+#                    BYBIT AUTHENTICATION
 # ============================================================
-def sign(message: str) -> str:
-    return base64.b64encode(
-        hmac.new(
-            SECRET_KEY.encode(),
-            message.encode(),
-            digestmod=hashlib.sha256
-        ).digest()
-    ).decode()
+def sign_request(timestamp: str, params: str) -> str:
+    param_str = timestamp + API_KEY + "5000" + params
+    signature = hmac.new(
+        SECRET_KEY.encode(),
+        param_str.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
 
-
-def make_headers(method: str, path: str, body: str = "") -> dict:
-    ts  = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    msg = ts + method + path + body
+def make_headers(payload: str = "") -> dict:
+    timestamp = str(int(time.time() * 1000))
     return {
-        "OK-ACCESS-KEY":        API_KEY,
-        "OK-ACCESS-SIGN":       sign(msg),
-        "OK-ACCESS-TIMESTAMP":  ts,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type":         "application/json"
+        "X-BAPI-API-KEY":    API_KEY,
+        "X-BAPI-SIGN":       sign_request(timestamp, payload),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW": "5000",
+        "Content-Type":      "application/json"
     }
 
 
 # ============================================================
-#                    REQUEST
+#                    REQUEST HANDLER
 # ============================================================
 def req(method: str, path: str, body: str = None):
     try:
         url = BASE_URL + path
-        h   = make_headers(method, path, body or "")
+        h = make_headers(body or "")
         if method == "GET":
             r = requests.get(url, headers=h, timeout=10)
         else:
@@ -94,37 +90,7 @@ def req(method: str, path: str, body: str = None):
 
 
 # ============================================================
-#                    LEVERAGE
-# ============================================================
-def set_leverage():
-    body = json.dumps({
-        "instId":  SYMBOL,
-        "lever":   str(LEVERAGE),
-        "mgnMode": "cross"
-    })
-    r = req("POST", "/api/v5/account/set-leverage", body)
-    if r.get("code") == "0":
-        log("LEVERAGE", f"✅ {LEVERAGE}x set on {SYMBOL}")
-    else:
-        log("LEVERAGE", f"❌ Failed: {r}")
-
-
-# ============================================================
-#                    CONTRACT VALUE
-# ============================================================
-def get_ct_val() -> float:
-    # XRP-USDT-SWAP ke liye ctVal = 1
-    if "XRP" in SYMBOL:
-        return 1.0
-    r = req("GET", f"/api/v5/public/instruments?instType=SWAP&instId={SYMBOL}")
-    try:
-        return float(r["data"][0]["ctVal"])
-    except Exception:
-        return 1.0
-
-
-# ============================================================
-#                    STATE
+#                    STATE MANAGEMENT
 # ============================================================
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
@@ -135,7 +101,6 @@ def load_state() -> dict:
     except Exception:
         return {"pos": None}
 
-
 def save_state(s: dict):
     with open(STATE_FILE, "w") as f:
         json.dump(s, f, indent=2)
@@ -145,44 +110,50 @@ def save_state(s: dict):
 #                    MARKET DATA
 # ============================================================
 def get_candles():
-    r = req("GET", f"/api/v5/market/candles?instId={SYMBOL}&bar={INTERVAL}&limit=300")
-    if r.get("code") == "0":
-        return list(reversed(r["data"]))
+    r = req("GET", f"/v5/market/kline?category={CATEGORY}&symbol={SYMBOL}&interval={INTERVAL}&limit=300")
+    if r.get("retCode") == 0 and r.get("result", {}).get("list"):
+        return list(reversed(r["result"]["list"]))
     log("DATA", "❌ Candles fetch failed")
     return []
 
-
 def get_price() -> float | None:
-    r = req("GET", f"/api/v5/market/ticker?instId={SYMBOL}")
+    r = req("GET", f"/v5/market/tickers?category={CATEGORY}&symbol={SYMBOL}")
     try:
-        return float(r["data"][0]["last"])
+        return float(r["result"]["list"][0]["lastPrice"])
     except Exception:
         return None
-
 
 def get_balance() -> float | None:
-    r = req("GET", "/api/v5/account/balance")
+    r = req("GET", "/v5/account/wallet-balance?accountType=UNIFIED&coin=USDT")
     try:
-        for d in r["data"][0]["details"]:
-            if d["ccy"] == "USDT":
-                return float(d["availBal"])
+        for coin in r["result"]["list"][0]["coin"]:
+            if coin["coin"] == "USDT":
+                return float(coin["availableToWithdraw"])
     except Exception:
         return None
 
-
-# ============================================================
-#           REAL POSITION SYNC
-# ============================================================
 def get_open_position() -> dict | None:
-    r = req("GET", f"/api/v5/account/positions?instId={SYMBOL}")
+    r = req("GET", f"/v5/position/list?category={CATEGORY}&symbol={SYMBOL}")
     try:
-        for pos in r["data"]:
-            sz = float(pos.get("pos", 0))
-            if sz != 0:
+        for pos in r["result"]["list"]:
+            if float(pos["size"]) > 0:
                 return pos
     except Exception:
         pass
     return None
+
+def set_leverage():
+    body = json.dumps({
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "buyLeverage": str(LEVERAGE),
+        "sellLeverage": str(LEVERAGE)
+    })
+    r = req("POST", "/v5/position/set-leverage", body)
+    if r.get("retCode") == 0:
+        log("LEVERAGE", f"✅ {LEVERAGE}x set on {SYMBOL}")
+    else:
+        log("LEVERAGE", f"❌ Failed: {r}")
 
 
 # ============================================================
@@ -197,7 +168,6 @@ def find_swings(closes: list, lb: int = SWING_LB) -> list:
             swings.append(("L", i, closes[i]))
     return swings
 
-
 def detect_bos(swings: list) -> str | None:
     if len(swings) < 3:
         return None
@@ -207,7 +177,6 @@ def detect_bos(swings: list) -> str | None:
     if b[0] == "H" and c[0] == "L" and c[2] < a[2]:
         return "BOS_DOWN"
     return None
-
 
 def detect_choch(swings: list) -> str | None:
     if len(swings) < 4:
@@ -220,7 +189,6 @@ def detect_choch(swings: list) -> str | None:
         if d[2] > b[2]:
             return "LONG"
     return None
-
 
 def detect_fvg(candles: list) -> tuple | None:
     if len(candles) < 3:
@@ -235,7 +203,6 @@ def detect_fvg(candles: list) -> tuple | None:
     if c2_high < c0_low:
         return ("bear", c2_high, c0_low)
     return None
-
 
 def detect_liquidity(candles: list) -> bool:
     if len(candles) < 2:
@@ -253,7 +220,7 @@ def detect_liquidity(candles: list) -> bool:
 
 
 # ============================================================
-#                    ATR CALCULATION
+#                    ATR & SMART SL
 # ============================================================
 def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
     if len(candles) < period + 1:
@@ -269,17 +236,9 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
         return 0.0
     return sum(tr_values[-period:]) / period
 
-
-# ============================================================
-#                    SMART STOP LOSS (Swing Based)
-# ============================================================
 def smart_stop_loss(side: str, swings: list, current_price: float) -> float:
-    """
-    Swing highs/lows ke peeche SL chhupao.
-    """
     if not swings:
         return None
-    
     if side == "buy":
         lows = [s[2] for s in swings if s[0] == "L"]
         if len(lows) >= 2:
@@ -287,8 +246,8 @@ def smart_stop_loss(side: str, swings: list, current_price: float) -> float:
         elif len(lows) == 1:
             return lows[-1] * 0.999
         else:
-            return current_price * 0.98   # fallback 2%
-    else:  # sell
+            return current_price * 0.98
+    else:
         highs = [s[2] for s in swings if s[0] == "H"]
         if len(highs) >= 2:
             return highs[-2] * 1.001
@@ -299,167 +258,108 @@ def smart_stop_loss(side: str, swings: list, current_price: float) -> float:
 
 
 # ============================================================
-#                    ORDER PLACEMENT (FIXED)
+#                    ORDER PLACEMENT
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
-    """
-    Step 1: Market order.
-    Step 2: Algo order for TP/SL.
-    """
     sz_int = int(size)
-    
-    # ---- Step 1: Market Order ----
-    body_market = json.dumps({
-        "instId":  SYMBOL,
-        "tdMode":  "cross",
-        "side":    side,
-        "ordType": "market",
-        "sz":      str(sz_int)
+    body = json.dumps({
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": side,
+        "orderType": "Market",
+        "qty": str(sz_int),
+        "positionIdx": 0,
+        "takeProfit": str(round(tp, 4)),
+        "stopLoss": str(round(sl, 4)),
+        "tpOrderType": "Market",
+        "slOrderType": "Market"
     })
-    
-    result = req("POST", "/api/v5/trade/order", body_market)
-    if result.get("code") != "0":
-        log("ORDER", f"❌ Market order failed: {result}")
-        send_telegram(f"❌ MARKET ORDER FAILED\n{SYMBOL}\n{result}")
+    result = req("POST", "/v5/order/create", body)
+    if result.get("retCode") != 0:
+        log("ORDER", f"❌ Order failed: {result}")
+        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{result}")
         return result
-    
-    log("ORDER", f"✅ Market order placed.")
-    time.sleep(1)
-    
-    # ---- Step 2: TP/SL Algo Order ----
-    algo_side = "sell" if side == "buy" else "buy"
-    tp_str = str(round(tp, 4))
-    sl_str = str(round(sl, 4))
-    
-    body_algo = json.dumps({
-        "instId":      SYMBOL,
-        "tdMode":      "cross",
-        "side":        algo_side,
-        "ordType":     "conditional",
-        "sz":          str(sz_int),
-        "tpTriggerPx": tp_str,
-        "tpOrdPx":     "-1",
-        "slTriggerPx": sl_str,
-        "slOrdPx":     "-1",
-        "posSide":     "net",
-        "reduceOnly":  "true"
-    })
-    
-    algo_res = req("POST", "/api/v5/trade/order-algo", body_algo)
-    if algo_res.get("code") != "0":
-        log("ALGO", f"❌ TP/SL failed: {algo_res}")
-        send_telegram(f"⚠️ TP/SL FAILED\n{SYMBOL}\nMarket OK, Algo Fail:\n{algo_res}")
-    else:
-        log("ALGO", "✅ TP/SL set successfully")
-        send_telegram(f"✅ TP/SL SET\n{SYMBOL}\nTP: {tp_str}\nSL: {sl_str}")
-    
+    log("ORDER", f"✅ Market order with TP/SL placed.")
     return result
 
-
 def close_position(side: str, size: float) -> dict:
-    close_side = "sell" if side == "buy" else "buy"
+    close_side = "Sell" if side == "Buy" else "Buy"
     body = json.dumps({
-        "instId":   SYMBOL,
-        "tdMode":   "cross",
-        "side":     close_side,
-        "ordType":  "market",
-        "sz":       str(int(size)),
-        "reduceOnly": "true"
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": close_side,
+        "orderType": "Market",
+        "qty": str(int(size)),
+        "positionIdx": 0,
+        "reduceOnly": True
     })
-    return req("POST", "/api/v5/trade/order", body)
+    return req("POST", "/v5/order/create", body)
 
 
 # ============================================================
-#                    TRADE DETAILS DISPLAY
+#                    TRADE DISPLAY
 # ============================================================
 def print_trade_details(action: str, side: str, entry: float,
                         sl: float, tp: float, size: float,
                         bal: float, risk_usdt: float):
     risk_pct  = (risk_usdt / bal) * 100 if bal else 0
     reward    = abs(tp - entry) * size
-    direction = "⬆️  LONG" if side == "buy" else "⬇️  SHORT"
-
+    direction = "⬆️  LONG" if side == "Buy" else "⬇️  SHORT"
     print("\n" + "="*55)
     print(f"  {action}")
     print("="*55)
     print(f"  Pair      : {SYMBOL}")
     print(f"  Direction : {direction}")
     print(f"  Entry     : {entry:.4f} USDT")
-    print(f"  Stop Loss : {sl:.4f} USDT  ({'below' if side=='buy' else 'above'} entry)")
+    print(f"  Stop Loss : {sl:.4f} USDT")
     print(f"  Take Prof : {tp:.4f} USDT  (RR 1:{RR_RATIO})")
     print(f"  Size      : {size} contracts")
     print(f"  Leverage  : {LEVERAGE}x")
-    print(f"  Risk      : {risk_usdt:.2f} USDT  ({risk_pct:.1f}% of balance)")
-    print(f"  Reward    : {reward:.2f} USDT (if TP hit)")
+    print(f"  Risk      : {risk_usdt:.2f} USDT ({risk_pct:.1f}%)")
     print(f"  Balance   : {bal:.2f} USDT")
     print("="*55 + "\n")
 
 
 # ============================================================
-#                    MAIN RUN LOOP
+#                    MAIN LOOP
 # ============================================================
 def run():
     state = load_state()
-
-    # ---- Candles + Price ----
     candles = get_candles()
     if not candles:
         return "No candle data"
-
     p = get_price()
     if not p:
         return "No price"
-
     closes = [float(x[4]) for x in candles]
 
-    # ---- POSITION CHECK ----
     actual_pos = get_open_position()
-
     if actual_pos:
         if not state.get("pos"):
-            log("SYNC", "⚡ OKX pe position mili — state sync")
-            pos_side = "buy" if float(actual_pos["pos"]) > 0 else "sell"
+            log("SYNC", "⚡ Bybit pe position mili — state sync")
+            pos_side = "Buy" if actual_pos["side"] == "Buy" else "Sell"
             state["pos"]   = pos_side
-            state["size"]  = abs(float(actual_pos["pos"]))
-            state["entry"] = float(actual_pos.get("avgPx", p))
+            state["size"]  = float(actual_pos["size"])
+            state["entry"] = float(actual_pos["avgPrice"])
             save_state(state)
-
-        # Reverse signal exit
-        swings = find_swings(closes)
-        choch  = detect_choch(swings)
-        if state.get("pos"):
-            if (state["pos"] == "buy" and choch == "SHORT") or (state["pos"] == "sell" and choch == "LONG"):
-                log("SIGNAL", f"🔁 Reverse CHoCH ({choch}), closing position")
-                close_res = close_position(state["pos"], state["size"])
-                if close_res.get("code") == "0":
-                    log("EXIT", "✅ Position closed on reverse signal")
-                    save_state({"pos": None})
-                    send_telegram(f"🔁 POSITION CLOSED (Reverse)\n{SYMBOL}")
-                    return "Closed on reverse signal"
-
         entry = state.get("entry", p)
         sl    = state.get("sl", 0)
         tp    = state.get("tp", 0)
-        pnl   = (p - entry) if state["pos"] == "buy" else (entry - p)
-
-        log("STATUS", f"📊 Position: {state['pos'].upper()} | Entry: {entry:.4f} | "
-                      f"Now: {p:.4f} | PnL: {pnl:+.4f} | SL: {sl:.4f} | TP: {tp:.4f}")
+        pnl   = (p - entry) if state["pos"] == "Buy" else (entry - p)
+        log("STATUS", f"📊 Position: {state['pos'].upper()} | Entry: {entry:.4f} | Now: {p:.4f} | PnL: {pnl:+.4f}")
         return "Position running"
-
     else:
         if state.get("pos"):
             log("SYNC", "✅ Position closed — state reset")
             save_state({"pos": None})
             state = {"pos": None}
 
-    # ---- ENTRY LOGIC ----
     swings = find_swings(closes)
     bos    = detect_bos(swings)
     choch  = detect_choch(swings)
     fvg    = detect_fvg(candles)
     liq    = detect_liquidity(candles)
 
-    # Volume Filter
     volumes = [float(c[5]) for c in candles[-20:]]
     avg_vol = sum(volumes[:-1]) / (len(volumes) - 1) if len(volumes) > 1 else 0
     current_vol = volumes[-1]
@@ -469,19 +369,17 @@ def run():
 
     side = None
     reason = ""
-
-    # Entry conditions with volume filter
     if choch == "LONG" and liq and volume_surge:
-        side = "buy"
+        side = "Buy"
         reason = "CHoCH LONG + Liq + Volume"
     elif choch == "SHORT" and liq and volume_surge:
-        side = "sell"
+        side = "Sell"
         reason = "CHoCH SHORT + Liq + Volume"
     elif bos == "BOS_UP" and fvg and fvg[0] == "bull" and volume_surge:
-        side = "buy"
+        side = "Buy"
         reason = "BOS UP + Bullish FVG + Volume"
     elif bos == "BOS_DOWN" and fvg and fvg[0] == "bear" and volume_surge:
-        side = "sell"
+        side = "Sell"
         reason = "BOS DOWN + Bearish FVG + Volume"
 
     if not side:
@@ -490,100 +388,64 @@ def run():
 
     log("SIGNAL", f"✅ Setup: {reason} → {side.upper()}")
 
-    # ---- BALANCE + SIZE (WITH SAFETY BUFFER) ----
     bal = get_balance()
     if not bal:
         return "No balance"
 
-    ct_val = get_ct_val()
     position_value = bal * POSITION_PCT
-    exposure       = position_value * LEVERAGE
-    size = math.floor(exposure / (p * ct_val))
-
+    exposure = position_value * LEVERAGE
+    size = math.floor(exposure / p)
     if size < 1:
-        size = 1   # Force minimum 1 contract
+        size = 1
 
-    # Recalculate actual margin required with 5% safety buffer
-    required_margin = (size * p * ct_val) / LEVERAGE
-    safe_required = required_margin * 1.05   # 5% buffer for fees/slippage
-    
-    if safe_required > bal:
-        log("SIZE", f"❌ Insufficient margin. Required: {safe_required:.2f}, Available: {bal:.2f}")
-        send_telegram(f"⚠️ INSUFFICIENT MARGIN\n{SYMBOL}\nRequired: {safe_required:.2f} USDT\nAvailable: {bal:.2f} USDT")
-        return "Insufficient margin"
-
-    notional = size * p * ct_val
-    if notional < 10:
-        log("SIZE", f"❌ Notional value ${notional:.2f} < $10 minimum.")
-        return "Size too small"
-
-    # ---- SMART STOP LOSS ----
-    sl = smart_stop_loss(side, swings, p)
+    sl = smart_stop_loss("buy" if side == "Buy" else "sell", swings, p)
     if sl is None:
-        # Fallback to ATR
         atr = calc_atr(candles)
         sl_distance = atr * ATR_MULTIPLIER
-        if side == "buy":
+        if side == "Buy":
             sl = p - sl_distance
         else:
             sl = p + sl_distance
-        log("SL", f"Using ATR fallback SL: {sl:.4f} (ATR: {atr:.4f})")
+        log("SL", f"Using ATR fallback SL: {sl:.4f}")
     else:
-        log("SL", f"Using Smart SL: {sl:.4f} (swing based)")
+        log("SL", f"Using Smart SL: {sl:.4f}")
 
-    # ---- TP Calculation ----
-    if side == "buy":
+    if side == "Buy":
         tp = p + (abs(p - sl) * RR_RATIO)
     else:
         tp = p - (abs(p - sl) * RR_RATIO)
 
-    risk_usdt = abs(p - sl) * size * ct_val
+    risk_usdt = abs(p - sl) * size
     if risk_usdt <= 0:
         return "Invalid risk"
 
-    # ---- PLACE ORDER ----
     result = place_order(side, size, tp, sl)
-
-    if result.get("code") != "0":
-        err_msg = result.get("msg", "Unknown error")
-        log("ORDER", f"❌ FAILED: {err_msg}")
-        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{err_msg}")
+    if result.get("retCode") != 0:
         return "Order failed"
 
-    # ---- SAVE STATE ----
     state.update({
-        "pos":    side,
-        "entry":  p,
-        "sl":     sl,
-        "tp":     tp,
-        "size":   size,
-        "reason": reason,
-        "opened": datetime.utcnow().isoformat()
+        "pos": side, "entry": p, "sl": sl, "tp": tp,
+        "size": size, "reason": reason, "opened": datetime.utcnow().isoformat()
     })
     save_state(state)
 
-    # ---- DISPLAY ----
     print_trade_details("🚀 TRADE OPENED", side, p, sl, tp, size, bal, risk_usdt)
 
-    # ---- TELEGRAM ----
-    direction_emoji = "🟢 LONG" if side == "buy" else "🔴 SHORT"
+    direction_emoji = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
     tg_msg = f"""
 🚀 TRADE OPENED — {SYMBOL}
-
 Direction  : {direction_emoji}
 Reason     : {reason}
 Entry      : {p:.4f} USDT
 Stop Loss  : {sl:.4f} USDT
-Take Profit: {tp:.4f} USDT  (RR 1:{RR_RATIO})
+Take Profit: {tp:.4f} USDT (RR 1:{RR_RATIO})
 Size       : {size} contracts
 Leverage   : {LEVERAGE}x
 Risk       : {risk_usdt:.2f} USDT
 Balance    : {bal:.2f} USDT
-
-⚙️ TP/SL Exchange pe set hai ✅
+⚙️ TP/SL Bybit pe set hai ✅
 """
     send_telegram(tg_msg)
-
     return "✅ Trade Opened"
 
 
@@ -592,19 +454,11 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  OKX SMC BOT — XRP Optimized")
-    log("BOT", f"  Pair     : {SYMBOL}")
-    log("BOT", f"  Interval : {INTERVAL}")
-    log("BOT", f"  Leverage : {LEVERAGE}x")
-    log("BOT", f"  Position : {int(POSITION_PCT*100)}% of balance")
-    log("BOT", f"  SL Type  : Smart Swing + ATR({ATR_PERIOD})*{ATR_MULTIPLIER}")
-    log("BOT", f"  RR Ratio : 1:{RR_RATIO}")
-    log("BOT", f"  Volume Filter: ON (>1.5x avg)")
+    log("BOT", "  BYBIT SMC BOT — ADAUSDT")
+    log("BOT", f"  Leverage : {LEVERAGE}x | Position: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
     log("BOT", "="*50)
-
     set_leverage()
-    send_telegram(f"🤖 OKX SMC Bot Started\n{SYMBOL} | {LEVERAGE}x | Smart SL | RR 1:{RR_RATIO}")
-
+    send_telegram(f"🤖 Bybit Bot Started\n{SYMBOL} | {LEVERAGE}x | RR 1:{RR_RATIO}")
     while True:
         try:
             result = run()
@@ -614,7 +468,6 @@ def main():
             log("ERROR", str(e))
             send_telegram(f"⚠️ BOT ERROR: {e}")
             time.sleep(15)
-
 
 if __name__ == "__main__":
     main()
