@@ -18,7 +18,7 @@ STATE_FILE   = "state_okx.json"
 SYMBOL       = "XRP-USDT-SWAP"
 INTERVAL     = "5m"
 LEVERAGE     = 5
-POSITION_PCT = 0.40          # Wallet ka 40% (margin safe rahega)
+POSITION_PCT = 0.30          # Wallet ka 30% (margin safe rahega)
 SWING_LB     = 3             # Swing lookback bars
 RR_RATIO     = 1.5           # Risk:Reward 1:1.5
 ATR_PERIOD   = 14
@@ -490,7 +490,7 @@ def run():
 
     log("SIGNAL", f"✅ Setup: {reason} → {side.upper()}")
 
-    # ---- BALANCE + SIZE (FIXED WITH MARGIN CHECK) ----
+    # ---- BALANCE + SIZE (WITH SAFETY BUFFER) ----
     bal = get_balance()
     if not bal:
         return "No balance"
@@ -503,11 +503,13 @@ def run():
     if size < 1:
         size = 1   # Force minimum 1 contract
 
-    # Recalculate actual margin required
+    # Recalculate actual margin required with 5% safety buffer
     required_margin = (size * p * ct_val) / LEVERAGE
-    if required_margin > bal:
-        log("SIZE", f"❌ Insufficient margin. Required: {required_margin:.2f}, Available: {bal:.2f}")
-        send_telegram(f"⚠️ INSUFFICIENT MARGIN\n{SYMBOL}\nRequired: {required_margin:.2f} USDT\nAvailable: {bal:.2f} USDT")
+    safe_required = required_margin * 1.05   # 5% buffer for fees/slippage
+    
+    if safe_required > bal:
+        log("SIZE", f"❌ Insufficient margin. Required: {safe_required:.2f}, Available: {bal:.2f}")
+        send_telegram(f"⚠️ INSUFFICIENT MARGIN\n{SYMBOL}\nRequired: {safe_required:.2f} USDT\nAvailable: {bal:.2f} USDT")
         return "Insufficient margin"
 
     notional = size * p * ct_val
