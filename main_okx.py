@@ -319,7 +319,7 @@ def print_trade_details(action: str, side: str, entry: float,
 
 
 # ============================================================
-#                    MAIN LOOP
+#                    MAIN LOOP (UPDATED)
 # ============================================================
 def run():
     state = load_state()
@@ -358,21 +358,24 @@ def run():
     fvg    = detect_fvg(candles)
     liq    = detect_liquidity(candles)
 
+    # ✅ UPDATED: Volume filter thoda loose (1.2)
     volumes = [float(c[5]) for c in candles[-20:]]
     avg_vol = sum(volumes[:-1]) / (len(volumes) - 1) if len(volumes) > 1 else 0
     current_vol = volumes[-1]
-    volume_surge = current_vol > avg_vol * 1.5
+    volume_surge = current_vol > avg_vol * 1.2   # ✅ Pehle 1.5 tha
 
     log("SMC", f"BOS={bos} | CHoCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq} | VolSurge={volume_surge}")
 
     side = None
     reason = ""
-    if choch == "LONG" and liq and volume_surge:
+
+    # ✅ UPDATED: CHoCH ke liye Liq optional hai
+    if choch == "LONG" and volume_surge:
         side = "Buy"
-        reason = "CHoCH LONG + Liq + Volume"
-    elif choch == "SHORT" and liq and volume_surge:
+        reason = "CHoCH LONG + Volume"
+    elif choch == "SHORT" and volume_surge:
         side = "Sell"
-        reason = "CHoCH SHORT + Liq + Volume"
+        reason = "CHoCH SHORT + Volume"
     elif bos == "BOS_UP" and fvg and fvg[0] == "bull" and volume_surge:
         side = "Buy"
         reason = "BOS UP + Bullish FVG + Volume"
@@ -454,9 +457,10 @@ def main():
     log("BOT", "="*50)
     log("BOT", "  BYBIT SMC BOT — ADAUSDT (SINGAPORE)")
     log("BOT", f"  Leverage : {LEVERAGE}x | Position: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
+    log("BOT", f"  Volume Filter: 1.2x (Loose)")
     log("BOT", "="*50)
     set_leverage()
-    send_telegram(f"🤖 Bybit Bot Started\n{SYMBOL} | {LEVERAGE}x | RR 1:{RR_RATIO}")
+    send_telegram(f"🤖 Bybit Bot Started\n{SYMBOL} | {LEVERAGE}x | RR 1:{RR_RATIO} | VolFilter 1.2x")
     while True:
         try:
             result = run()
