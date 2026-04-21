@@ -16,18 +16,18 @@ from config_okx import API_KEY, SECRET_KEY
 BASE_URL = "https://api.bybit.com"
 STATE_FILE = "state_bybit.json"
 
-SYMBOL = "XRPUSDT"
+SYMBOLS = ["XRPUSDT", "DOGEUSDT", "TRXUSDT", "XLMUSDT", "HBARUSDT"]
 CATEGORY = "linear"
-INTERVAL = "5"          # 5-minute candles
+INTERVAL = "5"
+
 LEVERAGE = 15
-POSITION_PCT = 0.10     # 10% of wallet
+POSITION_PCT = 0.10
 RR_RATIO = 1.5
 SWING_LB = 3
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
 RECV_WINDOW = "5000"
 
-# Telegram
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
 CHAT_ID = "1118069943"
 
@@ -48,7 +48,7 @@ def send_telegram(msg: str) -> None:
         log("TG_ERR", str(e))
 
 # ============================================================
-# BYBIT AUTH
+# AUTH
 # ============================================================
 def _sign(payload: str, timestamp: str) -> str:
     plain = f"{timestamp}{API_KEY}{RECV_WINDOW}{payload}"
@@ -68,20 +68,15 @@ def _headers(payload: str, timestamp: str) -> dict:
     }
 
 # ============================================================
-# HTTP REQUESTS
+# HTTP
 # ============================================================
 def req(method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
-    """
-    GET signature payload = query string
-    POST signature payload = json body string
-    """
     try:
         timestamp = str(int(time.time() * 1000))
 
         if method.upper() == "GET":
             query_string = urlencode(params or {})
-            payload = query_string
-            headers = _headers(payload, timestamp)
+            headers = _headers(query_string, timestamp)
             url = f"{BASE_URL}{path}"
             if query_string:
                 url += f"?{query_string}"
@@ -89,8 +84,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 
         elif method.upper() == "POST":
             body_str = json.dumps(body or {}, separators=(",", ":"))
-            payload = body_str
-            headers = _headers(payload, timestamp)
+            headers = _headers(body_str, timestamp)
             url = f"{BASE_URL}{path}"
             r = requests.post(url, headers=headers, data=body_str, timeout=15)
 
@@ -99,7 +93,6 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 
         data = r.json()
 
-        # Useful debug for Railway logs
         if data.get("retCode") not in (0, None):
             log("API_RET", f"{path} -> retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
@@ -115,6 +108,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 # ============================================================
 def default_state() -> dict:
     return {
+        "symbol": None,
         "pos": None,
         "entry": None,
         "sl": None,
@@ -130,9 +124,9 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        base = default_state()
-        base.update(data)
-        return base
+        state = default_state()
+        state.update(data)
+        return state
     except Exception:
         return default_state()
 
@@ -143,42 +137,36 @@ def save_state(state: dict) -> None:
 # ============================================================
 # MARKET DATA
 # ============================================================
-def get_candles() -> list:
+def get_candles(symbol: str) -> list:
     r = req(
         "GET",
         "/v5/market/kline",
         params={
             "category": CATEGORY,
-            "symbol": SYMBOL,
+            "symbol": symbol,
             "interval": INTERVAL,
             "limit": 300,
         },
     )
     if r.get("retCode") == 0 and r.get("result", {}).get("list"):
-        # Bybit newest first -> reverse for oldest->newest
         return list(reversed(r["result"]["list"]))
-    log("CANDLES", f"Failed: {r}")
     return []
 
-def get_price() -> float | None:
+def get_price(symbol: str) -> float | None:
     r = req(
         "GET",
         "/v5/market/tickers",
         params={
             "category": CATEGORY,
-            "symbol": SYMBOL,
+            "symbol": symbol,
         },
     )
     try:
         return float(r["result"]["list"][0]["lastPrice"])
     except Exception:
-        log("PRICE", f"Failed: {r}")
         return None
 
 def get_balance() -> float | None:
-    """
-    Unified wallet balance for USDT coin.
-    """
     r = req(
         "GET",
         "/v5/account/wallet-balance",
@@ -187,31 +175,46 @@ def get_balance() -> float | None:
             "coin": "USDT",
         },
     )
-
     try:
         coin_list = r["result"]["list"][0]["coin"]
         if not coin_list:
-            log("BALANCE", f"No coin data in response: {r}")
+            log("BALANCE", f"No coin data: {r}")
             return None
-
         usdt = coin_list[0]
         wallet_balance = float(usdt.get("walletBalance", 0))
         equity = float(usdt.get("equity", wallet_balance))
-
-        # For simple bot sizing, walletBalance is fine for coin balance visibility.
         log("BALANCE", f"walletBalance={wallet_balance} equity={equity}")
         return wallet_balance
     except Exception as e:
         log("BALANCE_ERR", f"{e} | RAW={r}")
         return None
 
-def get_open_position() -> dict | None:
+def get_instrument_info(symbol: str) -> dict | None:
+    r = req(
+        "GET",
+        "/v5/market/instruments-info",
+        params={
+            "category": CATEGORY,
+            "symbol": symbol,
+        },
+    )
+    try:
+        info = r["result"]["list"][0]
+        return {
+            "qty_step": float(info["lotSizeFilter"]["qtyStep"]),
+            "min_order_qty": float(info["lotSizeFilter"]["minOrderQty"]),
+            "tick_size": float(info["priceFilter"]["tickSize"]),
+        }
+    except Exception:
+        return None
+
+def get_open_position(symbol: str) -> dict | None:
     r = req(
         "GET",
         "/v5/position/list",
         params={
             "category": CATEGORY,
-            "symbol": SYMBOL,
+            "symbol": symbol,
         },
     )
     try:
@@ -220,6 +223,7 @@ def get_open_position() -> dict | None:
             side = pos.get("side", "")
             if size > 0 and side in ("Buy", "Sell"):
                 return {
+                    "symbol": symbol,
                     "side": side,
                     "size": size,
                     "entry": float(pos.get("avgPrice", 0)),
@@ -228,25 +232,44 @@ def get_open_position() -> dict | None:
                     "stopLoss": pos.get("stopLoss"),
                 }
     except Exception as e:
-        log("POS_ERR", f"{e} | RAW={r}")
+        log("POS_ERR", f"{symbol} -> {e}")
     return None
 
-def set_leverage() -> None:
+def find_any_open_position() -> dict | None:
+    for symbol in SYMBOLS:
+        pos = get_open_position(symbol)
+        if pos:
+            return pos
+    return None
+
+def set_leverage(symbol: str) -> None:
     body = {
         "category": CATEGORY,
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "buyLeverage": str(LEVERAGE),
         "sellLeverage": str(LEVERAGE),
     }
     r = req("POST", "/v5/position/set-leverage", body=body)
     if r.get("retCode") == 0:
-        log("LEVERAGE", f"✅ Set {LEVERAGE}x on {SYMBOL}")
+        log("LEVERAGE", f"✅ Set {LEVERAGE}x on {symbol}")
     else:
-        # retCode 110043/110044 etc can happen if already set; log only
-        log("LEVERAGE", f"Response: {r}")
+        log("LEVERAGE", f"{symbol} -> {r.get('retMsg', r)}")
 
 # ============================================================
-# STRATEGY HELPERS
+# HELPERS
+# ============================================================
+def floor_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(value / step) * step
+
+def round_price(price: float, tick_size: float) -> float:
+    if tick_size <= 0:
+        return price
+    return round(round(price / tick_size) * tick_size, 8)
+
+# ============================================================
+# STRATEGY
 # ============================================================
 def find_swings(closes: list[float], lb: int = SWING_LB) -> list[tuple]:
     swings = []
@@ -342,116 +365,18 @@ def smart_stop_loss(side: str, swings: list[tuple], current_price: float, candle
         atr = calc_atr(candles)
         return current_price + (atr * ATR_MULTIPLIER) if atr > 0 else current_price * 1.02
 
-# ============================================================
-# ORDER HELPERS
-# ============================================================
-def build_order_qty(balance_usdt: float, price: float) -> int:
-    """
-    10% wallet * 15x leverage -> exposure
-    qty for XRPUSDT is in XRP contracts (base coin units).
-    """
-    position_value = balance_usdt * POSITION_PCT
-    exposure = position_value * LEVERAGE
-    qty = math.floor(exposure / price)
-    return max(qty, 1)
-
-def place_order(side: str, qty: int, tp: float, sl: float) -> dict:
-    body = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "timeInForce": "IOC",
-        "positionIdx": 0,
-        "takeProfit": str(round(tp, 4)),
-        "stopLoss": str(round(sl, 4)),
-        "tpTriggerBy": "MarkPrice",
-        "slTriggerBy": "MarkPrice",
-    }
-    r = req("POST", "/v5/order/create", body=body)
-    return r
-
-def close_position(side: str, qty: int) -> dict:
-    close_side = "Sell" if side == "Buy" else "Buy"
-    body = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": close_side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "positionIdx": 0,
-        "reduceOnly": True,
-    }
-    r = req("POST", "/v5/order/create", body=body)
-    return r
-
-# ============================================================
-# DISPLAY
-# ============================================================
-def print_trade_details(action: str, side: str, entry: float, sl: float, tp: float, qty: int, balance_usdt: float) -> None:
-    risk_usdt = abs(entry - sl) * qty
-    reward_usdt = abs(tp - entry) * qty
-    risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
-
-    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
-
-    print("\n" + "=" * 60)
-    print(action)
-    print("=" * 60)
-    print(f"Pair      : {SYMBOL}")
-    print(f"Direction : {direction}")
-    print(f"Entry     : {entry:.4f}")
-    print(f"SL        : {sl:.4f}")
-    print(f"TP        : {tp:.4f}")
-    print(f"Qty       : {qty}")
-    print(f"Leverage  : {LEVERAGE}x")
-    print(f"Risk      : {risk_usdt:.4f} USDT ({risk_pct:.2f}%)")
-    print(f"Reward    : {reward_usdt:.4f} USDT")
-    print(f"Balance   : {balance_usdt:.4f} USDT")
-    print("=" * 60 + "\n")
-
-# ============================================================
-# CORE
-# ============================================================
-def run() -> str:
-    state = load_state()
-
-    candles = get_candles()
+def scan_symbol(symbol: str) -> dict | None:
+    candles = get_candles(symbol)
     if not candles:
-        return "No candle data"
+        log("SCAN", f"{symbol} -> no candles")
+        return None
 
-    price = get_price()
+    price = get_price(symbol)
     if not price:
-        return "No price"
+        log("SCAN", f"{symbol} -> no price")
+        return None
 
     closes = [float(c[4]) for c in candles]
-
-    # Sync with exchange position
-    actual_pos = get_open_position()
-    if actual_pos:
-        if not state.get("pos"):
-            state["pos"] = actual_pos["side"]
-            state["size"] = int(float(actual_pos["size"]))
-            state["entry"] = float(actual_pos["entry"])
-            # keep previous TP/SL if state absent, but not fatal
-            save_state(state)
-            log("SYNC", f"Exchange position synced: {state['pos']} qty={state['size']} entry={state['entry']}")
-
-        entry = float(state.get("entry") or actual_pos["entry"])
-        pos_side = state["pos"]
-        pnl = (price - entry) if pos_side == "Buy" else (entry - price)
-
-        log("POSITION", f"{pos_side} | entry={entry:.4f} now={price:.4f} pnl={pnl:+.4f}")
-        return "Position running"
-
-    # If exchange position gone, reset local state
-    if state.get("pos"):
-        log("SYNC", "Position closed on exchange -> resetting local state")
-        save_state(default_state())
-        state = default_state()
-
-    # Strategy
     swings = find_swings(closes)
     bos = detect_bos(swings)
     choch = detect_choch(swings)
@@ -459,11 +384,11 @@ def run() -> str:
     liq = detect_liquidity(candles)
 
     volumes = [float(c[5]) for c in candles[-20:]]
-    avg_vol = sum(volumes[:-1]) / max(len(volumes[:-1]), 1)
+    avg_vol = sum(volumes[:-1]) / max(len(volumes[:-1]), 1) if len(volumes) > 1 else 0
     current_vol = volumes[-1] if volumes else 0
     volume_surge = current_vol > avg_vol * 1.2 if avg_vol > 0 else False
 
-    log("SMC", f"BOS={bos} | CHOCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq} | Vol={volume_surge}")
+    log("SMC", f"{symbol} | BOS={bos} | CHOCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq} | Vol={volume_surge}")
 
     side = None
     reason = None
@@ -482,83 +407,223 @@ def run() -> str:
         reason = "BOS DOWN + Bearish FVG + Volume"
 
     if not side:
-        log("SIGNAL", "No setup")
-        return "No setup"
+        return None
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "reason": reason,
+        "price": price,
+        "candles": candles,
+        "swings": swings,
+    }
+
+# ============================================================
+# ORDER
+# ============================================================
+def build_order_qty(symbol: str, balance_usdt: float, price: float) -> float | None:
+    instrument = get_instrument_info(symbol)
+    if not instrument:
+        log("SIZE", f"{symbol} -> instrument info failed")
+        return None
+
+    position_value = balance_usdt * POSITION_PCT
+    exposure = position_value * LEVERAGE
+    raw_qty = exposure / price
+
+    qty = floor_to_step(raw_qty, instrument["qty_step"])
+    if qty < instrument["min_order_qty"]:
+        qty = instrument["min_order_qty"]
+
+    qty = round(qty, 8)
+    return qty
+
+def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "side": side,
+        "orderType": "Market",
+        "qty": str(qty),
+        "timeInForce": "IOC",
+        "positionIdx": 0,
+        "takeProfit": str(tp),
+        "stopLoss": str(sl),
+        "tpTriggerBy": "MarkPrice",
+        "slTriggerBy": "MarkPrice",
+    }
+    return req("POST", "/v5/order/create", body=body)
+
+# ============================================================
+# DISPLAY
+# ============================================================
+def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, balance_usdt: float) -> None:
+    risk_usdt = abs(entry - sl) * qty
+    reward_usdt = abs(tp - entry) * qty
+    risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
+
+    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
+
+    print("\n" + "=" * 60)
+    print(action)
+    print("=" * 60)
+    print(f"Pair      : {symbol}")
+    print(f"Direction : {direction}")
+    print(f"Entry     : {entry:.6f}")
+    print(f"SL        : {sl:.6f}")
+    print(f"TP        : {tp:.6f}")
+    print(f"Qty       : {qty}")
+    print(f"Leverage  : {LEVERAGE}x")
+    print(f"Risk      : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
+    print(f"Reward    : {reward_usdt:.6f} USDT")
+    print(f"Balance   : {balance_usdt:.6f} USDT")
+    print("=" * 60 + "\n")
+
+# ============================================================
+# CORE
+# ============================================================
+def run() -> str:
+    state = load_state()
+
+    # Only 1 active trade total
+    actual_pos = find_any_open_position()
+    if actual_pos:
+        if not state.get("pos"):
+            state.update({
+                "symbol": actual_pos["symbol"],
+                "pos": actual_pos["side"],
+                "size": actual_pos["size"],
+                "entry": actual_pos["entry"],
+            })
+            save_state(state)
+            log("SYNC", f"Synced exchange position: {actual_pos['symbol']} {actual_pos['side']} qty={actual_pos['size']}")
+        else:
+            state["symbol"] = actual_pos["symbol"]
+            state["pos"] = actual_pos["side"]
+            state["size"] = actual_pos["size"]
+            state["entry"] = actual_pos["entry"]
+            save_state(state)
+
+        entry = float(state.get("entry") or actual_pos["entry"])
+        pos_side = state["pos"]
+        symbol = state["symbol"]
+        mark = actual_pos.get("markPrice") or get_price(symbol) or entry
+        pnl = (mark - entry) if pos_side == "Buy" else (entry - mark)
+
+        log("POSITION", f"{symbol} | {pos_side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
+        return f"Position running on {symbol}"
+
+    # If exchange position gone, clear local state
+    if state.get("pos"):
+        log("SYNC", "No exchange position -> resetting local state")
+        save_state(default_state())
+        state = default_state()
 
     balance_usdt = get_balance()
     if balance_usdt is None or balance_usdt <= 0:
-        log("BALANCE", "No balance")
         return "No balance"
 
-    qty = build_order_qty(balance_usdt, price)
-    sl = smart_stop_loss(side, swings, price, candles)
+    # Scan pairs, take first valid setup only
+    for symbol in SYMBOLS:
+        setup = scan_symbol(symbol)
+        if not setup:
+            continue
 
-    if side == "Buy":
-        if sl >= price:
-            sl = price * 0.995
-        tp = price + (abs(price - sl) * RR_RATIO)
-    else:
-        if sl <= price:
-            sl = price * 1.005
-        tp = price - (abs(price - sl) * RR_RATIO)
+        price = setup["price"]
+        side = setup["side"]
+        reason = setup["reason"]
+        candles = setup["candles"]
+        swings = setup["swings"]
 
-    if tp <= 0 or sl <= 0:
-        log("RISK", f"Invalid TP/SL | price={price} sl={sl} tp={tp}")
-        return "Invalid TP/SL"
+        instrument = get_instrument_info(symbol)
+        if not instrument:
+            log("INFO", f"{symbol} -> no instrument info")
+            continue
 
-    log("DEBUG", f"balance={balance_usdt:.4f} price={price:.4f} qty={qty} side={side} sl={sl:.4f} tp={tp:.4f}")
+        qty = build_order_qty(symbol, balance_usdt, price)
+        if qty is None or qty <= 0:
+            log("SIZE", f"{symbol} -> invalid qty")
+            continue
 
-    order_res = place_order(side, qty, tp, sl)
-    if order_res.get("retCode") != 0:
-        log("ORDER_FAIL", str(order_res))
-        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{order_res}")
-        return "Order failed"
+        sl = smart_stop_loss(side, swings, price, candles)
 
-    state.update({
-        "pos": side,
-        "entry": price,
-        "sl": sl,
-        "tp": tp,
-        "size": qty,
-        "reason": reason,
-        "opened": datetime.now(UTC).isoformat(),
-    })
-    save_state(state)
+        if side == "Buy":
+            if sl >= price:
+                sl = price * 0.995
+            tp = price + (abs(price - sl) * RR_RATIO)
+        else:
+            if sl <= price:
+                sl = price * 1.005
+            tp = price - (abs(price - sl) * RR_RATIO)
 
-    print_trade_details("🚀 TRADE OPENED", side, price, sl, tp, qty, balance_usdt)
+        sl = round_price(sl, instrument["tick_size"])
+        tp = round_price(tp, instrument["tick_size"])
 
-    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
-    send_telegram(
-        f"🚀 TRADE OPENED\n"
-        f"Pair: {SYMBOL}\n"
-        f"Direction: {direction}\n"
-        f"Reason: {reason}\n"
-        f"Entry: {price:.4f}\n"
-        f"SL: {sl:.4f}\n"
-        f"TP: {tp:.4f}\n"
-        f"Qty: {qty}\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"Balance: {balance_usdt:.4f} USDT"
-    )
+        if tp <= 0 or sl <= 0:
+            log("RISK", f"{symbol} -> invalid TP/SL")
+            continue
 
-    return "Trade opened"
+        log("DEBUG", f"{symbol} | balance={balance_usdt:.4f} price={price:.6f} qty={qty} side={side} sl={sl} tp={tp}")
+
+        order_res = place_order(symbol, side, qty, tp, sl)
+        if order_res.get("retCode") != 0:
+            log("ORDER_FAIL", f"{symbol} -> {order_res}")
+            send_telegram(f"❌ ORDER FAILED\n{symbol}\n{order_res}")
+            continue
+
+        state.update({
+            "symbol": symbol,
+            "pos": side,
+            "entry": price,
+            "sl": sl,
+            "tp": tp,
+            "size": qty,
+            "reason": reason,
+            "opened": datetime.now(UTC).isoformat(),
+        })
+        save_state(state)
+
+        print_trade_details(symbol, "🚀 TRADE OPENED", side, price, sl, tp, qty, balance_usdt)
+
+        direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
+        send_telegram(
+            f"🚀 TRADE OPENED\n"
+            f"Pair: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Reason: {reason}\n"
+            f"Entry: {price:.6f}\n"
+            f"SL: {sl}\n"
+            f"TP: {tp}\n"
+            f"Qty: {qty}\n"
+            f"Leverage: {LEVERAGE}x\n"
+            f"Balance: {balance_usdt:.4f} USDT"
+        )
+
+        return f"Trade opened on {symbol}"
+
+    return "No setup on any pair"
 
 # ============================================================
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 56)
-    log("BOT", f"Bybit SMC Bot | {SYMBOL}")
+    log("BOT", "=" * 64)
+    log("BOT", "Bybit Multi-Pair SMC Bot")
+    log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
-    log("BOT", "=" * 56)
+    log("BOT", "Mode: Scan 5 pairs, only 1 active trade total")
+    log("BOT", "=" * 64)
 
-    set_leverage()
+    for symbol in SYMBOLS:
+        set_leverage(symbol)
+        time.sleep(0.3)
+
     send_telegram(
         f"🤖 BOT STARTED\n"
-        f"{SYMBOL}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
-        f"RR: 1:{RR_RATIO}"
+        f"Mode: 1 active trade only"
     )
 
     while True:
