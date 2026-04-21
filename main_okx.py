@@ -17,20 +17,20 @@ STATE_FILE   = "state_bybit.json"
 SYMBOL       = "XRP-USDT-SWAP"
 CATEGORY     = "linear"
 INTERVAL     = "5"
-LEVERAGE     = 10          # 10x لیوریج
-POSITION_PCT = 0.10        # والیٹ کا 10%
+LEVERAGE     = 10          # 10x leverage
+POSITION_PCT = 0.10        # 10% of wallet
 SWING_LB     = 3
 RR_RATIO     = 1.5
 ATR_PERIOD   = 14
 ATR_MULTIPLIER = 2.0
 
-# 🔔 ٹیلیگرام (اپنی تفصیلات ڈالیں)
+# 🔔 TELEGRAM (apni details dalo)
 TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
 CHAT_ID        = "1118069943"
 
 
 # ============================================================
-#                    لاگنگ اور ٹیلیگرام
+#                    LOGGING & TELEGRAM
 # ============================================================
 def log(tag: str, msg: str):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -47,7 +47,7 @@ def send_telegram(msg: str):
 
 
 # ============================================================
-#                    بائیبٹ کی تصدیق
+#                    BYBIT AUTHENTICATION
 # ============================================================
 def sign_request(timestamp: str, params: str) -> str:
     param_str = timestamp + API_KEY + "5000" + params
@@ -70,7 +70,7 @@ def make_headers(payload: str = "") -> dict:
 
 
 # ============================================================
-#                    درخواست ہینڈلر
+#                    REQUEST HANDLER
 # ============================================================
 def req(method: str, path: str, body: str = None):
     try:
@@ -88,7 +88,7 @@ def req(method: str, path: str, body: str = None):
 
 
 # ============================================================
-#                    اسٹیٹ مینجمنٹ
+#                    STATE MANAGEMENT
 # ============================================================
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
@@ -105,13 +105,13 @@ def save_state(s: dict):
 
 
 # ============================================================
-#                    مارکیٹ ڈیٹا
+#                    MARKET DATA
 # ============================================================
 def get_candles():
     r = req("GET", f"/v5/market/kline?category={CATEGORY}&symbol={SYMBOL}&interval={INTERVAL}&limit=300")
     if r.get("retCode") == 0 and r.get("result", {}).get("list"):
         return list(reversed(r["result"]["list"]))
-    log("DATA", "❌ کینڈلز حاصل نہیں ہو سکیں")
+    log("DATA", "❌ Candles fetch failed")
     return []
 
 def get_price() -> float | None:
@@ -151,11 +151,11 @@ def set_leverage():
     if r.get("retCode") == 0:
         log("LEVERAGE", f"✅ {LEVERAGE}x set on {SYMBOL}")
     else:
-        log("LEVERAGE", f"❌ ناکام: {r}")
+        log("LEVERAGE", f"❌ Failed: {r}")
 
 
 # ============================================================
-#                    ایس ایم سی لاجک
+#                    SMC LOGIC
 # ============================================================
 def find_swings(closes: list, lb: int = SWING_LB) -> list:
     swings = []
@@ -218,7 +218,7 @@ def detect_liquidity(candles: list) -> bool:
 
 
 # ============================================================
-#                    اے ٹی آر اور سمارٹ ایس ایل
+#                    ATR & SMART SL
 # ============================================================
 def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
     if len(candles) < period + 1:
@@ -256,7 +256,7 @@ def smart_stop_loss(side: str, swings: list, current_price: float) -> float:
 
 
 # ============================================================
-#                    آرڈر پلیسمنٹ
+#                    ORDER PLACEMENT
 # ============================================================
 def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     sz_int = int(size)
@@ -274,10 +274,10 @@ def place_order(side: str, size: float, tp: float, sl: float) -> dict:
     })
     result = req("POST", "/v5/order/create", body)
     if result.get("retCode") != 0:
-        log("ORDER", f"❌ آرڈر ناکام: {result}")
-        send_telegram(f"❌ آرڈر ناکام\n{SYMBOL}\n{result}")
+        log("ORDER", f"❌ Order failed: {result}")
+        send_telegram(f"❌ ORDER FAILED\n{SYMBOL}\n{result}")
         return result
-    log("ORDER", f"✅ مارکیٹ آرڈر بمعہ TP/SL لگا دیا گیا۔")
+    log("ORDER", f"✅ Market order with TP/SL placed.")
     return result
 
 def close_position(side: str, size: float) -> dict:
@@ -295,46 +295,46 @@ def close_position(side: str, size: float) -> dict:
 
 
 # ============================================================
-#                    ٹریڈ ڈسپلے
+#                    TRADE DISPLAY
 # ============================================================
 def print_trade_details(action: str, side: str, entry: float,
                         sl: float, tp: float, size: float,
                         bal: float, risk_usdt: float):
     risk_pct  = (risk_usdt / bal) * 100 if bal else 0
     reward    = abs(tp - entry) * size
-    direction = "⬆️  لانگ" if side == "Buy" else "⬇️  شارٹ"
+    direction = "⬆️  LONG" if side == "Buy" else "⬇️  SHORT"
     print("\n" + "="*55)
     print(f"  {action}")
     print("="*55)
-    print(f"  جوڑا     : {SYMBOL}")
-    print(f"  سمت      : {direction}")
-    print(f"  انٹری    : {entry:.4f} USDT")
-    print(f"  سٹاپ لاس : {sl:.4f} USDT")
-    print(f"  ٹیک پرافٹ: {tp:.4f} USDT  (RR 1:{RR_RATIO})")
-    print(f"  سائز     : {size} کانٹریکٹس")
-    print(f"  لیوریج   : {LEVERAGE}x")
-    print(f"  رسک      : {risk_usdt:.2f} USDT ({risk_pct:.1f}%)")
-    print(f"  بیلنس    : {bal:.2f} USDT")
+    print(f"  Pair      : {SYMBOL}")
+    print(f"  Direction : {direction}")
+    print(f"  Entry     : {entry:.4f} USDT")
+    print(f"  Stop Loss : {sl:.4f} USDT")
+    print(f"  Take Prof : {tp:.4f} USDT  (RR 1:{RR_RATIO})")
+    print(f"  Size      : {size} contracts")
+    print(f"  Leverage  : {LEVERAGE}x")
+    print(f"  Risk      : {risk_usdt:.2f} USDT ({risk_pct:.1f}%)")
+    print(f"  Balance   : {bal:.2f} USDT")
     print("="*55 + "\n")
 
 
 # ============================================================
-#                    مین لوپ
+#                    MAIN LOOP
 # ============================================================
 def run():
     state = load_state()
     candles = get_candles()
     if not candles:
-        return "کینڈل ڈیٹا نہیں ہے"
+        return "No candle data"
     p = get_price()
     if not p:
-        return "قیمت نہیں مل سکی"
+        return "No price"
     closes = [float(x[4]) for x in candles]
 
     actual_pos = get_open_position()
     if actual_pos:
         if not state.get("pos"):
-            log("SYNC", "⚡ بائیبٹ پر پوزیشن موجود ہے — اسٹیٹ سنک کر رہے ہیں")
+            log("SYNC", "⚡ Bybit pe position mili — state sync")
             pos_side = "Buy" if actual_pos["side"] == "Buy" else "Sell"
             state["pos"]   = pos_side
             state["size"]  = float(actual_pos["size"])
@@ -344,11 +344,11 @@ def run():
         sl    = state.get("sl", 0)
         tp    = state.get("tp", 0)
         pnl   = (p - entry) if state["pos"] == "Buy" else (entry - p)
-        log("STATUS", f"📊 پوزیشن: {state['pos'].upper()} | انٹری: {entry:.4f} | اب: {p:.4f} | نفع/نقصان: {pnl:+.4f}")
-        return "پوزیشن چل رہی ہے"
+        log("STATUS", f"📊 Position: {state['pos'].upper()} | Entry: {entry:.4f} | Now: {p:.4f} | PnL: {pnl:+.4f}")
+        return "Position running"
     else:
         if state.get("pos"):
-            log("SYNC", "✅ پوزیشن بند ہو گئی — اسٹیٹ ری سیٹ")
+            log("SYNC", "✅ Position closed — state reset")
             save_state({"pos": None})
             state = {"pos": None}
 
@@ -358,7 +358,7 @@ def run():
     fvg    = detect_fvg(candles)
     liq    = detect_liquidity(candles)
 
-    # حجم کا فلٹر (تھوڑا ڈھیلا)
+    # Volume filter (loose)
     volumes = [float(c[5]) for c in candles[-20:]]
     avg_vol = sum(volumes[:-1]) / (len(volumes) - 1) if len(volumes) > 1 else 0
     current_vol = volumes[-1]
@@ -369,29 +369,29 @@ def run():
     side = None
     reason = ""
 
-    # CHoCH کے لیے Liq لازمی نہیں
+    # CHoCH ke liye Liq optional
     if choch == "LONG" and volume_surge:
         side = "Buy"
-        reason = "CHoCH لانگ + حجم"
+        reason = "CHoCH LONG + Volume"
     elif choch == "SHORT" and volume_surge:
         side = "Sell"
-        reason = "CHoCH شارٹ + حجم"
+        reason = "CHoCH SHORT + Volume"
     elif bos == "BOS_UP" and fvg and fvg[0] == "bull" and volume_surge:
         side = "Buy"
-        reason = "BOS اپ + بُلش FVG + حجم"
+        reason = "BOS UP + Bullish FVG + Volume"
     elif bos == "BOS_DOWN" and fvg and fvg[0] == "bear" and volume_surge:
         side = "Sell"
-        reason = "BOS ڈاؤن + بئیرش FVG + حجم"
+        reason = "BOS DOWN + Bearish FVG + Volume"
 
     if not side:
-        log("SIGNAL", "⏳ کوئی SMC سیٹ اپ نہیں ملا — انتظار...")
-        return "کوئی سیٹ اپ نہیں"
+        log("SIGNAL", "⏳ No SMC setup — waiting...")
+        return "No setup"
 
-    log("SIGNAL", f"✅ سیٹ اپ: {reason} → {side.upper()}")
+    log("SIGNAL", f"✅ Setup: {reason} → {side.upper()}")
 
     bal = get_balance()
     if not bal:
-        return "بیلنس نہیں مل سکا"
+        return "No balance"
 
     position_value = bal * POSITION_PCT
     exposure = position_value * LEVERAGE
@@ -407,9 +407,9 @@ def run():
             sl = p - sl_distance
         else:
             sl = p + sl_distance
-        log("SL", f"ATR فال بیک SL استعمال ہوا: {sl:.4f}")
+        log("SL", f"Using ATR fallback SL: {sl:.4f}")
     else:
-        log("SL", f"سمارٹ SL استعمال ہوا: {sl:.4f}")
+        log("SL", f"Using Smart SL: {sl:.4f}")
 
     if side == "Buy":
         tp = p + (abs(p - sl) * RR_RATIO)
@@ -418,11 +418,11 @@ def run():
 
     risk_usdt = abs(p - sl) * size
     if risk_usdt <= 0:
-        return "غلط رسک"
+        return "Invalid risk"
 
     result = place_order(side, size, tp, sl)
     if result.get("retCode") != 0:
-        return "آرڈر ناکام"
+        return "Order failed"
 
     state.update({
         "pos": side, "entry": p, "sl": sl, "tp": tp,
@@ -430,37 +430,37 @@ def run():
     })
     save_state(state)
 
-    print_trade_details("🚀 ٹریڈ کھل گیا", side, p, sl, tp, size, bal, risk_usdt)
+    print_trade_details("🚀 TRADE OPENED", side, p, sl, tp, size, bal, risk_usdt)
 
-    direction_emoji = "🟢 لانگ" if side == "Buy" else "🔴 شارٹ"
+    direction_emoji = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
     tg_msg = f"""
-🚀 ٹریڈ کھل گیا — {SYMBOL}
-سمت       : {direction_emoji}
-وجہ       : {reason}
-انٹری     : {p:.4f} USDT
-سٹاپ لاس  : {sl:.4f} USDT
-ٹیک پرافٹ : {tp:.4f} USDT (RR 1:{RR_RATIO})
-سائز      : {size} کانٹریکٹس
-لیوریج    : {LEVERAGE}x
-رسک       : {risk_usdt:.2f} USDT
-بیلنس     : {bal:.2f} USDT
-⚙️ TP/SL بائیبٹ پر سیٹ ہے ✅
+🚀 TRADE OPENED — {SYMBOL}
+Direction  : {direction_emoji}
+Reason     : {reason}
+Entry      : {p:.4f} USDT
+Stop Loss  : {sl:.4f} USDT
+Take Profit: {tp:.4f} USDT (RR 1:{RR_RATIO})
+Size       : {size} contracts
+Leverage   : {LEVERAGE}x
+Risk       : {risk_usdt:.2f} USDT
+Balance    : {bal:.2f} USDT
+⚙️ TP/SL Bybit pe set hai ✅
 """
     send_telegram(tg_msg)
-    return "✅ ٹریڈ کھل گیا"
+    return "✅ Trade Opened"
 
 
 # ============================================================
-#                    انٹری پوائنٹ
+#                    ENTRY POINT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  بائیبٹ ایس ایم سی بوٹ — XRP-USDT-SWAP")
-    log("BOT", f"  لیوریج : {LEVERAGE}x | پوزیشن: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
-    log("BOT", f"  حجم کا فلٹر: 1.2x (ڈھیلا)")
+    log("BOT", "  BYBIT SMC BOT — XRP-USDT-SWAP")
+    log("BOT", f"  Leverage : {LEVERAGE}x | Position: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
+    log("BOT", f"  Volume Filter: 1.2x")
     log("BOT", "="*50)
     set_leverage()
-    send_telegram(f"🤖 بائیبٹ بوٹ شروع ہوا\n{SYMBOL} | {LEVERAGE}x | RR 1:{RR_RATIO} | VolFilter 1.2x")
+    send_telegram(f"🤖 Bybit Bot Started\n{SYMBOL} | {LEVERAGE}x | RR 1:{RR_RATIO} | VolFilter 1.2x")
     while True:
         try:
             result = run()
@@ -468,7 +468,7 @@ def main():
             time.sleep(60)
         except Exception as e:
             log("ERROR", str(e))
-            send_telegram(f"⚠️ بوٹ میں خرابی: {e}")
+            send_telegram(f"⚠️ BOT ERROR: {e}")
             time.sleep(15)
 
 if __name__ == "__main__":
