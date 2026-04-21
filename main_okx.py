@@ -11,7 +11,7 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 #                    CONFIGURATION (NETHERLANDS OPTIMIZED)
 # ============================================================
-BASE_URL     = "https://api.bybit.nl"   # ✅ Netherlands ke liye sahi endpoint
+BASE_URL     = "https://api.bybit.com"   # ✅ Netherlands ke liye sahi endpoint
 STATE_FILE   = "state_bybit.json"
 
 SYMBOL       = "XRP-USDT-SWAP"
@@ -25,8 +25,8 @@ ATR_PERIOD   = 14
 ATR_MULTIPLIER = 2.0
 
 # 🔔 TELEGRAM (apni details dalo)
-TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
-CHAT_ID        = "1118069943"
+TELEGRAM_TOKEN = "
+CHAT_ID        = ""
 
 
 # ============================================================
