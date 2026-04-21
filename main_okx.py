@@ -9,15 +9,15 @@ from datetime import datetime, timezone
 from config_okx import API_KEY, SECRET_KEY
 
 # ============================================================
-#                    CONFIGURATION (XRP-USDT-SWAP)
+#                    CONFIGURATION (NETHERLANDS OPTIMIZED)
 # ============================================================
-BASE_URL     = "https://api.bybit.ae"
+BASE_URL     = "https://api.bybit.nl"   # ✅ Netherlands ke liye sahi endpoint
 STATE_FILE   = "state_bybit.json"
 
 SYMBOL       = "XRP-USDT-SWAP"
 CATEGORY     = "linear"
 INTERVAL     = "5"
-LEVERAGE     = 10          # 10x leverage
+LEVERAGE     = 15          # 15x leverage (per aapki request)
 POSITION_PCT = 0.10        # 10% of wallet
 SWING_LB     = 3
 RR_RATIO     = 1.5
@@ -455,7 +455,7 @@ Balance    : {bal:.2f} USDT
 # ============================================================
 def main():
     log("BOT", "="*50)
-    log("BOT", "  BYBIT SMC BOT — XRP-USDT-SWAP")
+    log("BOT", "  BYBIT SMC BOT — XRP-USDT-SWAP (NETHERLANDS)")
     log("BOT", f"  Leverage : {LEVERAGE}x | Position: {int(POSITION_PCT*100)}% | RR: 1:{RR_RATIO}")
     log("BOT", f"  Volume Filter: 1.2x")
     log("BOT", "="*50)
