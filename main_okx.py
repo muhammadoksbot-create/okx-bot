@@ -16,9 +16,12 @@ from config_okx import API_KEY, SECRET_KEY
 BASE_URL = "https://api.bybit.com"
 STATE_FILE = "state_bybit.json"
 
-SYMBOLS = ["XRPUSDT", "DOGEUSDT", "TRXUSDT", "XLMUSDT", "HBARUSDT"]
+# ONLY 3 PAIRS NOW
+SYMBOLS = ["XRPUSDT", "DOGEUSDT", "HBARUSDT"]
+
 CATEGORY = "linear"
-INTERVAL = "5"
+ENTRY_INTERVAL = "5"
+TREND_INTERVAL = "60"
 
 LEVERAGE = 15
 POSITION_PCT = 0.10
@@ -28,8 +31,11 @@ ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
 RECV_WINDOW = "5000"
 
-TELEGRAM_TOKEN = "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U"
-CHAT_ID = "1118069943"
+VOLUME_MULTIPLIER = 1.3
+COOLDOWN_MINUTES = 20
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
+CHAT_ID = os.getenv("CHAT_ID", "1118069943")
 
 # ============================================================
 # LOGGING
@@ -89,7 +95,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
             r = requests.post(url, headers=headers, data=body_str, timeout=15)
 
         else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
+            raise ValueError(f"Unsupported method: {method}")
 
         data = r.json()
 
@@ -116,6 +122,7 @@ def default_state() -> dict:
         "size": None,
         "reason": None,
         "opened": None,
+        "last_closed_at": None,
     }
 
 def load_state() -> dict:
@@ -137,15 +144,15 @@ def save_state(state: dict) -> None:
 # ============================================================
 # MARKET DATA
 # ============================================================
-def get_candles(symbol: str) -> list:
+def get_candles(symbol: str, interval: str, limit: int = 300) -> list:
     r = req(
         "GET",
         "/v5/market/kline",
         params={
             "category": CATEGORY,
             "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": 300,
+            "interval": interval,
+            "limit": limit,
         },
     )
     if r.get("retCode") == 0 and r.get("result", {}).get("list"):
@@ -178,7 +185,6 @@ def get_balance() -> float | None:
     try:
         coin_list = r["result"]["list"][0]["coin"]
         if not coin_list:
-            log("BALANCE", f"No coin data: {r}")
             return None
         usdt = coin_list[0]
         wallet_balance = float(usdt.get("walletBalance", 0))
@@ -228,8 +234,6 @@ def get_open_position(symbol: str) -> dict | None:
                     "size": size,
                     "entry": float(pos.get("avgPrice", 0)),
                     "markPrice": float(pos.get("markPrice", 0) or 0),
-                    "takeProfit": pos.get("takeProfit"),
-                    "stopLoss": pos.get("stopLoss"),
                 }
     except Exception as e:
         log("POS_ERR", f"{symbol} -> {e}")
@@ -267,6 +271,15 @@ def round_price(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
     return round(round(price / tick_size) * tick_size, 8)
+
+def ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
 
 # ============================================================
 # STRATEGY
@@ -306,6 +319,7 @@ def detect_fvg(candles: list) -> tuple | None:
     if len(candles) < 3:
         return None
     c0, c2 = candles[-3], candles[-1]
+
     c0_high = float(c0[2])
     c0_low = float(c0[3])
     c2_high = float(c2[2])
@@ -320,6 +334,7 @@ def detect_fvg(candles: list) -> tuple | None:
 def detect_liquidity(candles: list) -> bool:
     if len(candles) < 2:
         return False
+
     last = candles[-1]
     prev = candles[-2]
 
@@ -331,6 +346,7 @@ def detect_liquidity(candles: list) -> bool:
 
     swept_high = (last_high > prev_high) and (last_close < prev_high)
     swept_low = (last_low < prev_low) and (last_close > prev_low)
+
     return swept_high or swept_low
 
 def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
@@ -348,27 +364,26 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
     return sum(trs[-period:]) / period if trs else 0.0
 
 def smart_stop_loss(side: str, swings: list[tuple], current_price: float, candles: list) -> float:
+    atr = calc_atr(candles)
+    atr_buffer = atr * 0.5 if atr > 0 else 0
+
     if side == "Buy":
         lows = [s[2] for s in swings if s[0] == "L"]
-        if len(lows) >= 2:
-            return lows[-2] * 0.999
-        if len(lows) == 1:
-            return lows[-1] * 0.999
-        atr = calc_atr(candles)
-        return current_price - (atr * ATR_MULTIPLIER) if atr > 0 else current_price * 0.98
-    else:
-        highs = [s[2] for s in swings if s[0] == "H"]
-        if len(highs) >= 2:
-            return highs[-2] * 1.001
-        if len(highs) == 1:
-            return highs[-1] * 1.001
-        atr = calc_atr(candles)
-        return current_price + (atr * ATR_MULTIPLIER) if atr > 0 else current_price * 1.02
+        if len(lows) >= 1:
+            return lows[-1] - atr_buffer
+        return current_price * 0.98
+
+    highs = [s[2] for s in swings if s[0] == "H"]
+    if len(highs) >= 1:
+        return highs[-1] + atr_buffer
+    return current_price * 1.02
 
 def scan_symbol(symbol: str) -> dict | None:
-    candles = get_candles(symbol)
-    if not candles:
-        log("SCAN", f"{symbol} -> no candles")
+    candles_5m = get_candles(symbol, ENTRY_INTERVAL, 300)
+    candles_1h = get_candles(symbol, TREND_INTERVAL, 250)
+
+    if not candles_5m or not candles_1h:
+        log("SCAN", f"{symbol} -> missing candles")
         return None
 
     price = get_price(symbol)
@@ -376,35 +391,49 @@ def scan_symbol(symbol: str) -> dict | None:
         log("SCAN", f"{symbol} -> no price")
         return None
 
-    closes = [float(c[4]) for c in candles]
-    swings = find_swings(closes)
+    closes_5m = [float(c[4]) for c in candles_5m]
+    closes_1h = [float(c[4]) for c in candles_1h]
+
+    swings = find_swings(closes_5m)
     bos = detect_bos(swings)
     choch = detect_choch(swings)
-    fvg = detect_fvg(candles)
-    liq = detect_liquidity(candles)
+    fvg = detect_fvg(candles_5m)
+    liq = detect_liquidity(candles_5m)
 
-    volumes = [float(c[5]) for c in candles[-20:]]
+    ema200 = ema(closes_1h, 200)
+    trend_up = ema200 is not None and price > ema200
+    trend_down = ema200 is not None and price < ema200
+
+    volumes = [float(c[5]) for c in candles_5m[-20:]]
     avg_vol = sum(volumes[:-1]) / max(len(volumes[:-1]), 1) if len(volumes) > 1 else 0
     current_vol = volumes[-1] if volumes else 0
-    volume_surge = current_vol > avg_vol * 1.2 if avg_vol > 0 else False
+    volume_surge = current_vol > avg_vol * VOLUME_MULTIPLIER if avg_vol > 0 else False
 
-    log("SMC", f"{symbol} | BOS={bos} | CHOCH={choch} | FVG={fvg[0] if fvg else None} | Liq={liq} | Vol={volume_surge}")
+    log(
+        "SMC",
+        f"{symbol} | BOS={bos} | CHOCH={choch} | FVG={fvg[0] if fvg else None} | "
+        f"Liq={liq} | Vol={volume_surge} | TrendUp={trend_up} | TrendDown={trend_down}"
+    )
 
     side = None
     reason = None
 
-    if choch == "LONG" and volume_surge:
-        side = "Buy"
-        reason = "CHoCH LONG + Volume"
-    elif choch == "SHORT" and volume_surge:
-        side = "Sell"
-        reason = "CHoCH SHORT + Volume"
-    elif bos == "BOS_UP" and fvg and fvg[0] == "bull" and volume_surge:
-        side = "Buy"
-        reason = "BOS UP + Bullish FVG + Volume"
-    elif bos == "BOS_DOWN" and fvg and fvg[0] == "bear" and volume_surge:
-        side = "Sell"
-        reason = "BOS DOWN + Bearish FVG + Volume"
+    # TIGHTER LOGIC
+    if trend_up and liq and volume_surge and fvg and fvg[0] == "bull":
+        if choch == "LONG":
+            side = "Buy"
+            reason = "HTF UP + CHOCH LONG + BULL FVG + LIQ + VOL"
+        elif bos == "BOS_UP":
+            side = "Buy"
+            reason = "HTF UP + BOS UP + BULL FVG + LIQ + VOL"
+
+    elif trend_down and liq and volume_surge and fvg and fvg[0] == "bear":
+        if choch == "SHORT":
+            side = "Sell"
+            reason = "HTF DOWN + CHOCH SHORT + BEAR FVG + LIQ + VOL"
+        elif bos == "BOS_DOWN":
+            side = "Sell"
+            reason = "HTF DOWN + BOS DOWN + BEAR FVG + LIQ + VOL"
 
     if not side:
         return None
@@ -414,7 +443,7 @@ def scan_symbol(symbol: str) -> dict | None:
         "side": side,
         "reason": reason,
         "price": price,
-        "candles": candles,
+        "candles": candles_5m,
         "swings": swings,
     }
 
@@ -435,8 +464,7 @@ def build_order_qty(symbol: str, balance_usdt: float, price: float) -> float | N
     if qty < instrument["min_order_qty"]:
         qty = instrument["min_order_qty"]
 
-    qty = round(qty, 8)
-    return qty
+    return round(qty, 8)
 
 def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
     body = {
@@ -453,6 +481,44 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
         "slTriggerBy": "MarkPrice",
     }
     return req("POST", "/v5/order/create", body=body)
+
+# ============================================================
+# TELEGRAM RESULT
+# ============================================================
+def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None]:
+    symbol = state.get("symbol")
+    side = state.get("pos")
+    entry = state.get("entry")
+    tp = state.get("tp")
+    sl = state.get("sl")
+    qty = state.get("size")
+
+    if not symbol or not side or entry is None or qty is None:
+        return ("Position Closed", None)
+
+    if last_price is None:
+        return ("Position Closed", None)
+
+    reason = "Position Closed"
+
+    if tp is not None and sl is not None:
+        if side == "Buy":
+            if abs(last_price - tp) <= abs(last_price - sl):
+                reason = "🎯 TP HIT"
+            else:
+                reason = "❌ SL HIT"
+        else:
+            if abs(last_price - tp) <= abs(last_price - sl):
+                reason = "🎯 TP HIT"
+            else:
+                reason = "❌ SL HIT"
+
+    if side == "Buy":
+        pnl = (last_price - entry) * qty
+    else:
+        pnl = (entry - last_price) * qty
+
+    return (reason, pnl)
 
 # ============================================================
 # DISPLAY
@@ -484,46 +550,68 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
 # ============================================================
 def run() -> str:
     state = load_state()
+    now_ts = time.time()
 
-    # Only 1 active trade total
+    # Check active position first
     actual_pos = find_any_open_position()
     if actual_pos:
-        if not state.get("pos"):
-            state.update({
-                "symbol": actual_pos["symbol"],
-                "pos": actual_pos["side"],
-                "size": actual_pos["size"],
-                "entry": actual_pos["entry"],
-            })
-            save_state(state)
-            log("SYNC", f"Synced exchange position: {actual_pos['symbol']} {actual_pos['side']} qty={actual_pos['size']}")
-        else:
-            state["symbol"] = actual_pos["symbol"]
-            state["pos"] = actual_pos["side"]
-            state["size"] = actual_pos["size"]
-            state["entry"] = actual_pos["entry"]
-            save_state(state)
+        state["symbol"] = actual_pos["symbol"]
+        state["pos"] = actual_pos["side"]
+        state["size"] = actual_pos["size"]
+        state["entry"] = actual_pos["entry"]
+        save_state(state)
 
-        entry = float(state.get("entry") or actual_pos["entry"])
-        pos_side = state["pos"]
-        symbol = state["symbol"]
-        mark = actual_pos.get("markPrice") or get_price(symbol) or entry
-        pnl = (mark - entry) if pos_side == "Buy" else (entry - mark)
+        symbol = actual_pos["symbol"]
+        side = actual_pos["side"]
+        entry = float(actual_pos["entry"])
+        mark = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else (get_price(symbol) or entry)
+        pnl = (mark - entry) * actual_pos["size"] if side == "Buy" else (entry - mark) * actual_pos["size"]
 
-        log("POSITION", f"{symbol} | {pos_side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
+        log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
         return f"Position running on {symbol}"
 
-    # If exchange position gone, clear local state
+    # If no position but state shows old one -> close detected
     if state.get("pos"):
-        log("SYNC", "No exchange position -> resetting local state")
-        save_state(default_state())
-        state = default_state()
+        symbol = state.get("symbol")
+        last_price = get_price(symbol) if symbol else None
+        close_reason, est_pnl = estimate_close_result(state, last_price)
+
+        pnl_text = "N/A"
+        if est_pnl is not None:
+            pnl_text = f"{est_pnl:.6f} USDT"
+
+        send_telegram(
+            f"{close_reason}\n"
+            f"Pair: {state.get('symbol')}\n"
+            f"Side: {state.get('pos')}\n"
+            f"Entry: {state.get('entry')}\n"
+            f"TP: {state.get('tp')}\n"
+            f"SL: {state.get('sl')}\n"
+            f"Exit Price: {last_price}\n"
+            f"Qty: {state.get('size')}\n"
+            f"Estimated PnL: {pnl_text}"
+        )
+
+        log("CLOSE", f"{close_reason} | {symbol} | est_pnl={pnl_text}")
+
+        new_state = default_state()
+        new_state["last_closed_at"] = now_ts
+        save_state(new_state)
+        state = new_state
+
+    # Cooldown after close
+    if state.get("last_closed_at"):
+        elapsed = now_ts - float(state["last_closed_at"])
+        cooldown_sec = COOLDOWN_MINUTES * 60
+        if elapsed < cooldown_sec:
+            remaining = int((cooldown_sec - elapsed) / 60)
+            return f"Cooldown active ({remaining} min left)"
 
     balance_usdt = get_balance()
     if balance_usdt is None or balance_usdt <= 0:
         return "No balance"
 
-    # Scan pairs, take first valid setup only
+    # Scan pairs; first valid setup only
     for symbol in SYMBOLS:
         setup = scan_symbol(symbol)
         if not setup:
@@ -537,12 +625,10 @@ def run() -> str:
 
         instrument = get_instrument_info(symbol)
         if not instrument:
-            log("INFO", f"{symbol} -> no instrument info")
             continue
 
         qty = build_order_qty(symbol, balance_usdt, price)
         if qty is None or qty <= 0:
-            log("SIZE", f"{symbol} -> invalid qty")
             continue
 
         sl = smart_stop_loss(side, swings, price, candles)
@@ -559,11 +645,10 @@ def run() -> str:
         sl = round_price(sl, instrument["tick_size"])
         tp = round_price(tp, instrument["tick_size"])
 
-        if tp <= 0 or sl <= 0:
-            log("RISK", f"{symbol} -> invalid TP/SL")
+        if sl <= 0 or tp <= 0:
             continue
 
-        log("DEBUG", f"{symbol} | balance={balance_usdt:.4f} price={price:.6f} qty={qty} side={side} sl={sl} tp={tp}")
+        log("DEBUG", f"{symbol} | side={side} | balance={balance_usdt:.4f} | price={price:.6f} | qty={qty} | sl={sl} | tp={tp}")
 
         order_res = place_order(symbol, side, qty, tp, sl)
         if order_res.get("retCode") != 0:
@@ -608,10 +693,11 @@ def run() -> str:
 # ============================================================
 def main() -> None:
     log("BOT", "=" * 64)
-    log("BOT", "Bybit Multi-Pair SMC Bot")
+    log("BOT", "Improved Bybit Multi-Pair SMC Bot")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
-    log("BOT", "Mode: Scan 5 pairs, only 1 active trade total")
+    log("BOT", f"Cooldown After Close: {COOLDOWN_MINUTES} min")
+    log("BOT", "Rules: 1h EMA trend + liquidity + volume + FVG mandatory")
     log("BOT", "=" * 64)
 
     for symbol in SYMBOLS:
@@ -623,6 +709,7 @@ def main() -> None:
         f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
+        f"Cooldown: {COOLDOWN_MINUTES} min\n"
         f"Mode: 1 active trade only"
     )
 
