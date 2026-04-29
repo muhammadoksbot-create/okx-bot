@@ -16,7 +16,6 @@ from config_okx import API_KEY, SECRET_KEY
 BASE_URL = "https://api.bybit.com"
 STATE_FILE = "state_bybit.json"
 
-# ONLY 3 PAIRS NOW
 SYMBOLS = ["XRPUSDT", "DOGEUSDT", "HBARUSDT"]
 
 CATEGORY = "linear"
@@ -33,6 +32,10 @@ RECV_WINDOW = "5000"
 
 VOLUME_MULTIPLIER = 1.3
 COOLDOWN_MINUTES = 20
+
+PARTIAL_AT_R = 1.0          # 1R pe partial
+PARTIAL_CLOSE_PCT = 0.50    # 50% close
+MOVE_SL_TO_BE = True
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
@@ -123,6 +126,11 @@ def default_state() -> dict:
         "reason": None,
         "opened": None,
         "last_closed_at": None,
+        "initial_risk": None,
+        "partial_taken": False,
+        "partial_qty": None,
+        "remaining_qty": None,
+        "breakeven_moved": False,
     }
 
 def load_state() -> dict:
@@ -234,6 +242,8 @@ def get_open_position(symbol: str) -> dict | None:
                     "size": size,
                     "entry": float(pos.get("avgPrice", 0)),
                     "markPrice": float(pos.get("markPrice", 0) or 0),
+                    "stopLoss": pos.get("stopLoss"),
+                    "takeProfit": pos.get("takeProfit"),
                 }
     except Exception as e:
         log("POS_ERR", f"{symbol} -> {e}")
@@ -280,6 +290,9 @@ def ema(values: list[float], period: int) -> float | None:
     for v in values[1:]:
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
+
+def iso_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 # ============================================================
 # STRATEGY
@@ -418,7 +431,6 @@ def scan_symbol(symbol: str) -> dict | None:
     side = None
     reason = None
 
-    # TIGHTER LOGIC
     if trend_up and liq and volume_surge and fvg and fvg[0] == "bull":
         if choch == "LONG":
             side = "Buy"
@@ -448,7 +460,7 @@ def scan_symbol(symbol: str) -> dict | None:
     }
 
 # ============================================================
-# ORDER
+# ORDER MANAGEMENT
 # ============================================================
 def build_order_qty(symbol: str, balance_usdt: float, price: float) -> float | None:
     instrument = get_instrument_info(symbol)
@@ -482,21 +494,67 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
     }
     return req("POST", "/v5/order/create", body=body)
 
+def reduce_position(symbol: str, current_side: str, qty: float) -> dict:
+    close_side = "Sell" if current_side == "Buy" else "Buy"
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "side": close_side,
+        "orderType": "Market",
+        "qty": str(qty),
+        "positionIdx": 0,
+        "reduceOnly": True,
+    }
+    return req("POST", "/v5/order/create", body=body)
+
+def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None = None) -> dict:
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "positionIdx": 0,
+    }
+    if sl is not None:
+        body["stopLoss"] = str(sl)
+        body["slTriggerBy"] = "MarkPrice"
+    if tp is not None:
+        body["takeProfit"] = str(tp)
+        body["tpTriggerBy"] = "MarkPrice"
+    return req("POST", "/v5/position/trading-stop", body=body)
+
 # ============================================================
-# TELEGRAM RESULT
+# RESULT / DISPLAY
 # ============================================================
-def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None]:
+def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, balance_usdt: float) -> None:
+    risk_usdt = abs(entry - sl) * qty
+    reward_usdt = abs(tp - entry) * qty
+    risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
+
+    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
+
+    print("\n" + "=" * 60)
+    print(action)
+    print("=" * 60)
+    print(f"Pair      : {symbol}")
+    print(f"Direction : {direction}")
+    print(f"Entry     : {entry:.6f}")
+    print(f"SL        : {sl:.6f}")
+    print(f"TP        : {tp:.6f}")
+    print(f"Qty       : {qty}")
+    print(f"Leverage  : {LEVERAGE}x")
+    print(f"Risk      : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
+    print(f"Reward    : {reward_usdt:.6f} USDT")
+    print(f"Balance   : {balance_usdt:.6f} USDT")
+    print("=" * 60 + "\n")
+
+def estimate_close_reason_and_pnl(state: dict, last_price: float | None) -> tuple[str, float | None]:
     symbol = state.get("symbol")
     side = state.get("pos")
     entry = state.get("entry")
     tp = state.get("tp")
     sl = state.get("sl")
-    qty = state.get("size")
+    qty = state.get("remaining_qty") or state.get("size")
 
-    if not symbol or not side or entry is None or qty is None:
-        return ("Position Closed", None)
-
-    if last_price is None:
+    if not symbol or not side or entry is None or qty is None or last_price is None:
         return ("Position Closed", None)
 
     reason = "Position Closed"
@@ -521,29 +579,76 @@ def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, f
     return (reason, pnl)
 
 # ============================================================
-# DISPLAY
+# POSITION MANAGEMENT
 # ============================================================
-def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, balance_usdt: float) -> None:
-    risk_usdt = abs(entry - sl) * qty
-    reward_usdt = abs(tp - entry) * qty
-    risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
+def manage_open_position(state: dict, actual_pos: dict) -> str:
+    symbol = actual_pos["symbol"]
+    side = actual_pos["side"]
+    mark = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else (get_price(symbol) or actual_pos["entry"])
+    entry = float(state.get("entry") or actual_pos["entry"])
+    size = float(actual_pos["size"])
+    initial_risk = state.get("initial_risk")
 
-    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
+    # sync state
+    state["symbol"] = symbol
+    state["pos"] = side
+    state["size"] = size
+    state["remaining_qty"] = size
+    if state.get("entry") is None:
+        state["entry"] = float(actual_pos["entry"])
+    save_state(state)
 
-    print("\n" + "=" * 60)
-    print(action)
-    print("=" * 60)
-    print(f"Pair      : {symbol}")
-    print(f"Direction : {direction}")
-    print(f"Entry     : {entry:.6f}")
-    print(f"SL        : {sl:.6f}")
-    print(f"TP        : {tp:.6f}")
-    print(f"Qty       : {qty}")
-    print(f"Leverage  : {LEVERAGE}x")
-    print(f"Risk      : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
-    print(f"Reward    : {reward_usdt:.6f} USDT")
-    print(f"Balance   : {balance_usdt:.6f} USDT")
-    print("=" * 60 + "\n")
+    pnl = (mark - entry) * size if side == "Buy" else (entry - mark) * size
+    log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
+
+    if not initial_risk or initial_risk <= 0:
+        return f"Position running on {symbol}"
+
+    current_r = ((mark - entry) / initial_risk) if side == "Buy" else ((entry - mark) / initial_risk)
+
+    # PARTIAL TAKE PROFIT
+    if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
+        instrument = get_instrument_info(symbol)
+        if instrument:
+            partial_qty = floor_to_step(size * PARTIAL_CLOSE_PCT, instrument["qty_step"])
+            if partial_qty >= instrument["min_order_qty"] and partial_qty < size:
+                r = reduce_position(symbol, side, partial_qty)
+                if r.get("retCode") == 0:
+                    state["partial_taken"] = True
+                    state["partial_qty"] = partial_qty
+                    state["remaining_qty"] = max(size - partial_qty, instrument["min_order_qty"])
+                    save_state(state)
+
+                    send_telegram(
+                        f"💰 PARTIAL TP TAKEN\n"
+                        f"Pair: {symbol}\n"
+                        f"Side: {side}\n"
+                        f"Entry: {entry}\n"
+                        f"Current Price: {mark}\n"
+                        f"Closed Qty: {partial_qty}\n"
+                        f"Remaining Qty: {state['remaining_qty']}\n"
+                        f"R Multiple: {current_r:.2f}R"
+                    )
+
+                    log("PARTIAL", f"{symbol} -> partial closed qty={partial_qty}")
+
+                    # move SL to BE after partial
+                    if MOVE_SL_TO_BE and not state.get("breakeven_moved"):
+                        be_sl = entry
+                        update_trading_stop(symbol, sl=be_sl)
+                        state["sl"] = be_sl
+                        state["breakeven_moved"] = True
+                        save_state(state)
+
+                        send_telegram(
+                            f"🛡️ SL MOVED TO BREAKEVEN\n"
+                            f"Pair: {symbol}\n"
+                            f"Side: {side}\n"
+                            f"New SL: {be_sl}"
+                        )
+                        log("BE", f"{symbol} -> moved SL to BE")
+
+    return f"Position running on {symbol}"
 
 # ============================================================
 # CORE
@@ -555,26 +660,17 @@ def run() -> str:
     # Check active position first
     actual_pos = find_any_open_position()
     if actual_pos:
-        state["symbol"] = actual_pos["symbol"]
-        state["pos"] = actual_pos["side"]
-        state["size"] = actual_pos["size"]
-        state["entry"] = actual_pos["entry"]
-        save_state(state)
+        return manage_open_position(state, actual_pos)
 
-        symbol = actual_pos["symbol"]
-        side = actual_pos["side"]
-        entry = float(actual_pos["entry"])
-        mark = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else (get_price(symbol) or entry)
-        pnl = (mark - entry) * actual_pos["size"] if side == "Buy" else (entry - mark) * actual_pos["size"]
-
-        log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
-        return f"Position running on {symbol}"
-
-    # If no position but state shows old one -> close detected
+    # Position closed
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
-        close_reason, est_pnl = estimate_close_result(state, last_price)
+        close_reason, est_pnl = estimate_close_reason_and_pnl(state, last_price)
+
+        partial_pnl_text = ""
+        if state.get("partial_taken"):
+            partial_pnl_text = f"\nPartial Closed: Yes\nPartial Qty: {state.get('partial_qty')}"
 
         pnl_text = "N/A"
         if est_pnl is not None:
@@ -589,7 +685,8 @@ def run() -> str:
             f"SL: {state.get('sl')}\n"
             f"Exit Price: {last_price}\n"
             f"Qty: {state.get('size')}\n"
-            f"Estimated PnL: {pnl_text}"
+            f"Estimated Remaining PnL: {pnl_text}"
+            f"{partial_pnl_text}"
         )
 
         log("CLOSE", f"{close_reason} | {symbol} | est_pnl={pnl_text}")
@@ -599,7 +696,7 @@ def run() -> str:
         save_state(new_state)
         state = new_state
 
-    # Cooldown after close
+    # Cooldown
     if state.get("last_closed_at"):
         elapsed = now_ts - float(state["last_closed_at"])
         cooldown_sec = COOLDOWN_MINUTES * 60
@@ -611,7 +708,7 @@ def run() -> str:
     if balance_usdt is None or balance_usdt <= 0:
         return "No balance"
 
-    # Scan pairs; first valid setup only
+    # Scan pairs
     for symbol in SYMBOLS:
         setup = scan_symbol(symbol)
         if not setup:
@@ -648,6 +745,10 @@ def run() -> str:
         if sl <= 0 or tp <= 0:
             continue
 
+        initial_risk = abs(price - sl)
+        if initial_risk <= 0:
+            continue
+
         log("DEBUG", f"{symbol} | side={side} | balance={balance_usdt:.4f} | price={price:.6f} | qty={qty} | sl={sl} | tp={tp}")
 
         order_res = place_order(symbol, side, qty, tp, sl)
@@ -663,8 +764,13 @@ def run() -> str:
             "sl": sl,
             "tp": tp,
             "size": qty,
+            "remaining_qty": qty,
             "reason": reason,
-            "opened": datetime.now(UTC).isoformat(),
+            "opened": iso_now(),
+            "initial_risk": initial_risk,
+            "partial_taken": False,
+            "partial_qty": None,
+            "breakeven_moved": False,
         })
         save_state(state)
 
@@ -681,7 +787,8 @@ def run() -> str:
             f"TP: {tp}\n"
             f"Qty: {qty}\n"
             f"Leverage: {LEVERAGE}x\n"
-            f"Balance: {balance_usdt:.4f} USDT"
+            f"Balance: {balance_usdt:.4f} USDT\n"
+            f"Partial Rule: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R"
         )
 
         return f"Trade opened on {symbol}"
@@ -692,13 +799,14 @@ def run() -> str:
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 64)
-    log("BOT", "Improved Bybit Multi-Pair SMC Bot")
+    log("BOT", "=" * 70)
+    log("BOT", "Improved Bybit Multi-Pair SMC Bot with Partial TP + BE")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown After Close: {COOLDOWN_MINUTES} min")
+    log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
     log("BOT", "Rules: 1h EMA trend + liquidity + volume + FVG mandatory")
-    log("BOT", "=" * 64)
+    log("BOT", "=" * 70)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
@@ -710,6 +818,7 @@ def main() -> None:
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
         f"Cooldown: {COOLDOWN_MINUTES} min\n"
+        f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
         f"Mode: 1 active trade only"
     )
 
