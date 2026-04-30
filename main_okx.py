@@ -36,10 +36,10 @@ PARTIAL_AT_R = 1.0
 PARTIAL_CLOSE_PCT = 0.50
 MOVE_SL_TO_BE = True
 
-# Fee-aware logic
-TAKER_FEE_RATE = 0.00055          # adjust later if needed
-MIN_NET_PROFIT_USDT = 0.01        # skip tiny trades
-MIN_R_MULTIPLE = 1.2              # avoid too-small target trades
+# Soft fee-aware settings
+TAKER_FEE_RATE = 0.00055
+MIN_NET_PROFIT_USDT = 0.003
+MIN_R_MULTIPLE = 1.0
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
@@ -551,7 +551,6 @@ def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None =
 # ============================================================
 def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, balance_usdt: float) -> None:
     risk_usdt = abs(entry - sl) * qty
-    reward_usdt = abs(tp - entry) * qty
     gross_tp, fees_tp, net_tp = net_pnl_estimate(side, entry, tp, qty)
     risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
 
@@ -568,9 +567,9 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
     print(f"Qty       : {qty}")
     print(f"Leverage  : {LEVERAGE}x")
     print(f"Risk      : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
-    print(f"Gross TP  : {gross_tp:.6f} USDT")
-    print(f"Fees TP   : {fees_tp:.6f} USDT")
-    print(f"Net TP    : {net_tp:.6f} USDT")
+    print(f"Est Gross : {gross_tp:.6f} USDT")
+    print(f"Est Fees  : {fees_tp:.6f} USDT")
+    print(f"Est Net   : {net_tp:.6f} USDT")
     print(f"Balance   : {balance_usdt:.6f} USDT")
     print("=" * 70 + "\n")
 
@@ -836,7 +835,7 @@ def run() -> str:
 # ============================================================
 def main() -> None:
     log("BOT", "=" * 78)
-    log("BOT", "Bybit Bot | Fee-Aware | Partial TP + BE | 3 Pairs")
+    log("BOT", "Bybit Bot | Soft Fee-Aware | Partial TP + BE | 3 Pairs")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Volume Multiplier: {VOLUME_MULTIPLIER}")
