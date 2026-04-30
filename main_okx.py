@@ -27,16 +27,19 @@ POSITION_PCT = 0.10
 RR_RATIO = 1.5
 SWING_LB = 3
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 2.0
 RECV_WINDOW = "5000"
 
-# ENTRY slightly loosened
 VOLUME_MULTIPLIER = 1.10
 COOLDOWN_MINUTES = 20
 
 PARTIAL_AT_R = 1.0
 PARTIAL_CLOSE_PCT = 0.50
 MOVE_SL_TO_BE = True
+
+# Fee-aware logic
+TAKER_FEE_RATE = 0.00055          # adjust later if needed
+MIN_NET_PROFIT_USDT = 0.01        # skip tiny trades
+MIN_R_MULTIPLE = 1.2              # avoid too-small target trades
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
@@ -78,40 +81,47 @@ def _headers(payload: str, timestamp: str) -> dict:
     }
 
 # ============================================================
-# HTTP
+# HTTP with retry
 # ============================================================
-def req(method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
-    try:
-        timestamp = str(int(time.time() * 1000))
+def req(method: str, path: str, params: dict | None = None, body: dict | None = None, retries: int = 3) -> dict:
+    last_err = None
 
-        if method.upper() == "GET":
-            query_string = urlencode(params or {})
-            headers = _headers(query_string, timestamp)
-            url = f"{BASE_URL}{path}"
-            if query_string:
-                url += f"?{query_string}"
-            r = requests.get(url, headers=headers, timeout=15)
+    for attempt in range(1, retries + 1):
+        try:
+            timestamp = str(int(time.time() * 1000))
 
-        elif method.upper() == "POST":
-            body_str = json.dumps(body or {}, separators=(",", ":"))
-            headers = _headers(body_str, timestamp)
-            url = f"{BASE_URL}{path}"
-            r = requests.post(url, headers=headers, data=body_str, timeout=15)
+            if method.upper() == "GET":
+                query_string = urlencode(params or {})
+                headers = _headers(query_string, timestamp)
+                url = f"{BASE_URL}{path}"
+                if query_string:
+                    url += f"?{query_string}"
+                r = requests.get(url, headers=headers, timeout=15)
 
-        else:
-            raise ValueError(f"Unsupported method: {method}")
+            elif method.upper() == "POST":
+                body_str = json.dumps(body or {}, separators=(",", ":"))
+                headers = _headers(body_str, timestamp)
+                url = f"{BASE_URL}{path}"
+                r = requests.post(url, headers=headers, data=body_str, timeout=15)
 
-        data = r.json()
+            else:
+                raise ValueError(f"Unsupported method: {method}")
 
-        if data.get("retCode") not in (0, None):
-            log("API_RET", f"{path} -> retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+            data = r.json()
 
-        return data
+            if data.get("retCode") not in (0, None):
+                log("API_RET", f"{path} -> retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
-    except Exception as e:
-        log("API_ERR", f"{path} -> {e}")
-        send_telegram(f"⚠️ API ERROR\n{path}\n{e}")
-        return {}
+            return data
+
+        except Exception as e:
+            last_err = e
+            log("API_ERR", f"{path} attempt {attempt}/{retries} -> {e}")
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+
+    send_telegram(f"⚠️ API ERROR\n{path}\n{last_err}")
+    return {}
 
 # ============================================================
 # STATE
@@ -243,8 +253,6 @@ def get_open_position(symbol: str) -> dict | None:
                     "size": size,
                     "entry": float(pos.get("avgPrice", 0)),
                     "markPrice": float(pos.get("markPrice", 0) or 0),
-                    "stopLoss": pos.get("stopLoss"),
-                    "takeProfit": pos.get("takeProfit"),
                 }
     except Exception as e:
         log("POS_ERR", f"{symbol} -> {e}")
@@ -294,6 +302,22 @@ def ema(values: list[float], period: int) -> float | None:
 
 def iso_now() -> str:
     return datetime.now(UTC).isoformat()
+
+def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
+    entry_notional = entry * qty
+    exit_notional = exit_price * qty
+    return (entry_notional * TAKER_FEE_RATE) + (exit_notional * TAKER_FEE_RATE)
+
+def gross_pnl(side: str, entry: float, exit_price: float, qty: float) -> float:
+    if side == "Buy":
+        return (exit_price - entry) * qty
+    return (entry - exit_price) * qty
+
+def net_pnl_estimate(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float, float]:
+    gross = gross_pnl(side, entry, exit_price, qty)
+    fees = estimate_round_trip_fees(entry, exit_price, qty)
+    net = gross - fees
+    return gross, fees, net
 
 # ============================================================
 # STRATEGY
@@ -432,11 +456,6 @@ def scan_symbol(symbol: str) -> dict | None:
     side = None
     reason = None
 
-    # ------------------------------------------------------------
-    # LONG LOGIC
-    # CHOCH needs matching FVG
-    # BOS does NOT require FVG, but if FVG exists it must match
-    # ------------------------------------------------------------
     if trend_up and liq and volume_surge:
         if choch == "LONG" and fvg and fvg[0] == "bull":
             side = "Buy"
@@ -445,11 +464,6 @@ def scan_symbol(symbol: str) -> dict | None:
             side = "Buy"
             reason = "HTF UP + BOS UP + LIQ + VOL"
 
-    # ------------------------------------------------------------
-    # SHORT LOGIC
-    # CHOCH needs matching FVG
-    # BOS does NOT require FVG, but if FVG exists it must match
-    # ------------------------------------------------------------
     elif trend_down and liq and volume_surge:
         if choch == "SHORT" and fvg and fvg[0] == "bear":
             side = "Sell"
@@ -533,18 +547,19 @@ def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None =
     return req("POST", "/v5/position/trading-stop", body=body)
 
 # ============================================================
-# RESULT / DISPLAY
+# DISPLAY / RESULT
 # ============================================================
 def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, balance_usdt: float) -> None:
     risk_usdt = abs(entry - sl) * qty
     reward_usdt = abs(tp - entry) * qty
+    gross_tp, fees_tp, net_tp = net_pnl_estimate(side, entry, tp, qty)
     risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
 
     direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(action)
-    print("=" * 60)
+    print("=" * 70)
     print(f"Pair      : {symbol}")
     print(f"Direction : {direction}")
     print(f"Entry     : {entry:.6f}")
@@ -553,11 +568,13 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
     print(f"Qty       : {qty}")
     print(f"Leverage  : {LEVERAGE}x")
     print(f"Risk      : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
-    print(f"Reward    : {reward_usdt:.6f} USDT")
+    print(f"Gross TP  : {gross_tp:.6f} USDT")
+    print(f"Fees TP   : {fees_tp:.6f} USDT")
+    print(f"Net TP    : {net_tp:.6f} USDT")
     print(f"Balance   : {balance_usdt:.6f} USDT")
-    print("=" * 60 + "\n")
+    print("=" * 70 + "\n")
 
-def estimate_close_reason_and_pnl(state: dict, last_price: float | None) -> tuple[str, float | None]:
+def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None, float | None, float | None]:
     symbol = state.get("symbol")
     side = state.get("pos")
     entry = state.get("entry")
@@ -566,28 +583,18 @@ def estimate_close_reason_and_pnl(state: dict, last_price: float | None) -> tupl
     qty = state.get("remaining_qty") or state.get("size")
 
     if not symbol or not side or entry is None or qty is None or last_price is None:
-        return ("Position Closed", None)
+        return ("Position Closed", None, None, None)
 
     reason = "Position Closed"
 
     if tp is not None and sl is not None:
         if side == "Buy":
-            if abs(last_price - tp) <= abs(last_price - sl):
-                reason = "🎯 TP HIT"
-            else:
-                reason = "❌ SL HIT"
+            reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
         else:
-            if abs(last_price - tp) <= abs(last_price - sl):
-                reason = "🎯 TP HIT"
-            else:
-                reason = "❌ SL HIT"
+            reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
 
-    if side == "Buy":
-        pnl = (last_price - entry) * qty
-    else:
-        pnl = (entry - last_price) * qty
-
-    return (reason, pnl)
+    gross, fees, net = net_pnl_estimate(side, entry, last_price, qty)
+    return reason, gross, fees, net
 
 # ============================================================
 # POSITION MANAGEMENT
@@ -608,8 +615,8 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
         state["entry"] = float(actual_pos["entry"])
     save_state(state)
 
-    pnl = (mark - entry) * size if side == "Buy" else (entry - mark) * size
-    log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} pnl={pnl:+.6f}")
+    gross_now, fees_now, net_now = net_pnl_estimate(side, entry, mark, size)
+    log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} gross={gross_now:+.6f} fees={fees_now:.6f} net={net_now:+.6f}")
 
     if not initial_risk or initial_risk <= 0:
         return f"Position running on {symbol}"
@@ -623,6 +630,8 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
             if partial_qty >= instrument["min_order_qty"] and partial_qty < size:
                 r = reduce_position(symbol, side, partial_qty)
                 if r.get("retCode") == 0:
+                    gross_part, fees_part, net_part = net_pnl_estimate(side, entry, mark, partial_qty)
+
                     state["partial_taken"] = True
                     state["partial_qty"] = partial_qty
                     state["remaining_qty"] = max(size - partial_qty, instrument["min_order_qty"])
@@ -636,6 +645,9 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
                         f"Current Price: {mark}\n"
                         f"Closed Qty: {partial_qty}\n"
                         f"Remaining Qty: {state['remaining_qty']}\n"
+                        f"Gross Partial: {gross_part:.6f} USDT\n"
+                        f"Est. Fees: {fees_part:.6f} USDT\n"
+                        f"Est. Net Partial: {net_part:.6f} USDT\n"
                         f"R Multiple: {current_r:.2f}R"
                     )
 
@@ -672,15 +684,15 @@ def run() -> str:
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
-        close_reason, est_pnl = estimate_close_reason_and_pnl(state, last_price)
+        close_reason, gross, fees, net = estimate_close_result(state, last_price)
 
-        partial_pnl_text = ""
+        partial_text = ""
         if state.get("partial_taken"):
-            partial_pnl_text = f"\nPartial Closed: Yes\nPartial Qty: {state.get('partial_qty')}"
+            partial_text = f"\nPartial Closed: Yes\nPartial Qty: {state.get('partial_qty')}"
 
-        pnl_text = "N/A"
-        if est_pnl is not None:
-            pnl_text = f"{est_pnl:.6f} USDT"
+        gross_text = "N/A" if gross is None else f"{gross:.6f} USDT"
+        fees_text = "N/A" if fees is None else f"{fees:.6f} USDT"
+        net_text = "N/A" if net is None else f"{net:.6f} USDT"
 
         send_telegram(
             f"{close_reason}\n"
@@ -691,11 +703,13 @@ def run() -> str:
             f"SL: {state.get('sl')}\n"
             f"Exit Price: {last_price}\n"
             f"Qty: {state.get('size')}\n"
-            f"Estimated Remaining PnL: {pnl_text}"
-            f"{partial_pnl_text}"
+            f"Gross PnL: {gross_text}\n"
+            f"Est. Fees: {fees_text}\n"
+            f"Est. Net PnL: {net_text}"
+            f"{partial_text}"
         )
 
-        log("CLOSE", f"{close_reason} | {symbol} | est_pnl={pnl_text}")
+        log("CLOSE", f"{close_reason} | {symbol} | gross={gross_text} fees={fees_text} net={net_text}")
 
         new_state = default_state()
         new_state["last_closed_at"] = now_ts
@@ -753,7 +767,22 @@ def run() -> str:
         if initial_risk <= 0:
             continue
 
-        log("DEBUG", f"{symbol} | side={side} | balance={balance_usdt:.4f} | price={price:.6f} | qty={qty} | sl={sl} | tp={tp}")
+        gross_tp, fees_tp, net_tp = net_pnl_estimate(side, price, tp, qty)
+        r_multiple = abs(tp - price) / initial_risk if initial_risk > 0 else 0
+
+        if net_tp < MIN_NET_PROFIT_USDT:
+            log("SKIP", f"{symbol} skipped: est net TP too small ({net_tp:.6f} USDT)")
+            continue
+
+        if r_multiple < MIN_R_MULTIPLE:
+            log("SKIP", f"{symbol} skipped: R multiple too small ({r_multiple:.2f})")
+            continue
+
+        log(
+            "DEBUG",
+            f"{symbol} | side={side} | balance={balance_usdt:.4f} | price={price:.6f} | "
+            f"qty={qty} | sl={sl} | tp={tp} | gross_tp={gross_tp:.6f} | fees_tp={fees_tp:.6f} | net_tp={net_tp:.6f}"
+        )
 
         order_res = place_order(symbol, side, qty, tp, sl)
         if order_res.get("retCode") != 0:
@@ -792,6 +821,9 @@ def run() -> str:
             f"Qty: {qty}\n"
             f"Leverage: {LEVERAGE}x\n"
             f"Balance: {balance_usdt:.4f} USDT\n"
+            f"Est. Gross TP: {gross_tp:.6f} USDT\n"
+            f"Est. Fees TP: {fees_tp:.6f} USDT\n"
+            f"Est. Net TP: {net_tp:.6f} USDT\n"
             f"Partial Rule: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R"
         )
 
@@ -803,15 +835,14 @@ def run() -> str:
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 72)
-    log("BOT", "Bybit Bot | 3 Pairs | Partial TP + BE | Entry Slightly Loosened")
+    log("BOT", "=" * 78)
+    log("BOT", "Bybit Bot | Fee-Aware | Partial TP + BE | 3 Pairs")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
-    log("BOT", f"Cooldown After Close: {COOLDOWN_MINUTES} min")
-    log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
-    log("BOT", f"Volume Multiplier: {VOLUME_MULTIPLIER}")
-    log("BOT", "CHOCH requires matching FVG | BOS allows optional FVG")
-    log("BOT", "=" * 72)
+    log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Volume Multiplier: {VOLUME_MULTIPLIER}")
+    log("BOT", f"Taker Fee Rate: {TAKER_FEE_RATE}")
+    log("BOT", f"Min Net Profit: {MIN_NET_PROFIT_USDT} USDT | Min R: {MIN_R_MULTIPLE}")
+    log("BOT", "=" * 78)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
@@ -823,9 +854,10 @@ def main() -> None:
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
         f"Cooldown: {COOLDOWN_MINUTES} min\n"
-        f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
         f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
-        f"CHOCH needs FVG | BOS optional FVG\n"
+        f"Taker Fee Rate: {TAKER_FEE_RATE}\n"
+        f"Min Net Profit: {MIN_NET_PROFIT_USDT} USDT\n"
+        f"Min R: {MIN_R_MULTIPLE}\n"
         f"Mode: 1 active trade only"
     )
 
