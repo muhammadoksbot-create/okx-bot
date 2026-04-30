@@ -30,11 +30,12 @@ ATR_PERIOD = 14
 ATR_MULTIPLIER = 2.0
 RECV_WINDOW = "5000"
 
-VOLUME_MULTIPLIER = 1.3
+# ENTRY slightly loosened
+VOLUME_MULTIPLIER = 1.10
 COOLDOWN_MINUTES = 20
 
-PARTIAL_AT_R = 1.0          # 1R pe partial
-PARTIAL_CLOSE_PCT = 0.50    # 50% close
+PARTIAL_AT_R = 1.0
+PARTIAL_CLOSE_PCT = 0.50
 MOVE_SL_TO_BE = True
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
@@ -431,21 +432,31 @@ def scan_symbol(symbol: str) -> dict | None:
     side = None
     reason = None
 
-    if trend_up and liq and volume_surge and fvg and fvg[0] == "bull":
-        if choch == "LONG":
+    # ------------------------------------------------------------
+    # LONG LOGIC
+    # CHOCH needs matching FVG
+    # BOS does NOT require FVG, but if FVG exists it must match
+    # ------------------------------------------------------------
+    if trend_up and liq and volume_surge:
+        if choch == "LONG" and fvg and fvg[0] == "bull":
             side = "Buy"
             reason = "HTF UP + CHOCH LONG + BULL FVG + LIQ + VOL"
-        elif bos == "BOS_UP":
+        elif bos == "BOS_UP" and (fvg is None or fvg[0] == "bull"):
             side = "Buy"
-            reason = "HTF UP + BOS UP + BULL FVG + LIQ + VOL"
+            reason = "HTF UP + BOS UP + LIQ + VOL"
 
-    elif trend_down and liq and volume_surge and fvg and fvg[0] == "bear":
-        if choch == "SHORT":
+    # ------------------------------------------------------------
+    # SHORT LOGIC
+    # CHOCH needs matching FVG
+    # BOS does NOT require FVG, but if FVG exists it must match
+    # ------------------------------------------------------------
+    elif trend_down and liq and volume_surge:
+        if choch == "SHORT" and fvg and fvg[0] == "bear":
             side = "Sell"
             reason = "HTF DOWN + CHOCH SHORT + BEAR FVG + LIQ + VOL"
-        elif bos == "BOS_DOWN":
+        elif bos == "BOS_DOWN" and (fvg is None or fvg[0] == "bear"):
             side = "Sell"
-            reason = "HTF DOWN + BOS DOWN + BEAR FVG + LIQ + VOL"
+            reason = "HTF DOWN + BOS DOWN + LIQ + VOL"
 
     if not side:
         return None
@@ -589,7 +600,6 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
     size = float(actual_pos["size"])
     initial_risk = state.get("initial_risk")
 
-    # sync state
     state["symbol"] = symbol
     state["pos"] = side
     state["size"] = size
@@ -606,7 +616,6 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
 
     current_r = ((mark - entry) / initial_risk) if side == "Buy" else ((entry - mark) / initial_risk)
 
-    # PARTIAL TAKE PROFIT
     if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
         instrument = get_instrument_info(symbol)
         if instrument:
@@ -632,7 +641,6 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
 
                     log("PARTIAL", f"{symbol} -> partial closed qty={partial_qty}")
 
-                    # move SL to BE after partial
                     if MOVE_SL_TO_BE and not state.get("breakeven_moved"):
                         be_sl = entry
                         update_trading_stop(symbol, sl=be_sl)
@@ -657,12 +665,10 @@ def run() -> str:
     state = load_state()
     now_ts = time.time()
 
-    # Check active position first
     actual_pos = find_any_open_position()
     if actual_pos:
         return manage_open_position(state, actual_pos)
 
-    # Position closed
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
@@ -696,7 +702,6 @@ def run() -> str:
         save_state(new_state)
         state = new_state
 
-    # Cooldown
     if state.get("last_closed_at"):
         elapsed = now_ts - float(state["last_closed_at"])
         cooldown_sec = COOLDOWN_MINUTES * 60
@@ -708,7 +713,6 @@ def run() -> str:
     if balance_usdt is None or balance_usdt <= 0:
         return "No balance"
 
-    # Scan pairs
     for symbol in SYMBOLS:
         setup = scan_symbol(symbol)
         if not setup:
@@ -799,14 +803,15 @@ def run() -> str:
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 70)
-    log("BOT", "Improved Bybit Multi-Pair SMC Bot with Partial TP + BE")
+    log("BOT", "=" * 72)
+    log("BOT", "Bybit Bot | 3 Pairs | Partial TP + BE | Entry Slightly Loosened")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown After Close: {COOLDOWN_MINUTES} min")
     log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
-    log("BOT", "Rules: 1h EMA trend + liquidity + volume + FVG mandatory")
-    log("BOT", "=" * 70)
+    log("BOT", f"Volume Multiplier: {VOLUME_MULTIPLIER}")
+    log("BOT", "CHOCH requires matching FVG | BOS allows optional FVG")
+    log("BOT", "=" * 72)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
@@ -819,6 +824,8 @@ def main() -> None:
         f"Leverage: {LEVERAGE}x\n"
         f"Cooldown: {COOLDOWN_MINUTES} min\n"
         f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
+        f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
+        f"CHOCH needs FVG | BOS optional FVG\n"
         f"Mode: 1 active trade only"
     )
 
