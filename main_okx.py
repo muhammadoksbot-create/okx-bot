@@ -16,7 +16,8 @@ from config_okx import API_KEY, SECRET_KEY
 BASE_URL = "https://api.bybit.com"
 STATE_FILE = "state_bybit.json"
 
-SYMBOLS = ["XRPUSDT", "DOGEUSDT", "HBARUSDT"]
+# XRP removed, 1000PEPE added
+SYMBOLS = ["DOGEUSDT", "HBARUSDT", "1000PEPEUSDT"]
 
 CATEGORY = "linear"
 ENTRY_INTERVAL = "5"
@@ -835,7 +836,7 @@ def run() -> str:
 # ============================================================
 def main() -> None:
     log("BOT", "=" * 78)
-    log("BOT", "Bybit Bot | Soft Fee-Aware | Partial TP + BE | 3 Pairs")
+    log("BOT", "Bybit Bot | Soft Fee-Aware | Partial TP + BE | DOGE + HBAR + 1000PEPE")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Volume Multiplier: {VOLUME_MULTIPLIER}")
