@@ -16,8 +16,8 @@ from config_okx import API_KEY, SECRET_KEY
 BASE_URL = "https://api.bybit.com"
 STATE_FILE = "state_bybit.json"
 
-# XRP removed, 1000PEPE added
-SYMBOLS = ["DOGEUSDT", "HBARUSDT", "1000PEPEUSDT"]
+# FINAL PAIRS ONLY
+SYMBOLS = ["DOGEUSDT", "HBARUSDT"]
 
 CATEGORY = "linear"
 ENTRY_INTERVAL = "5"
@@ -32,12 +32,15 @@ RECV_WINDOW = "5000"
 
 VOLUME_MULTIPLIER = 1.10
 COOLDOWN_MINUTES = 20
+CHECK_INTERVAL_SECONDS = 15
 
-PARTIAL_AT_R = 1.0
-PARTIAL_CLOSE_PCT = 0.50
+# FINAL EXIT SETTINGS
+BE_TRIGGER_R = 0.5
+PARTIAL_AT_R = 0.8
+PARTIAL_CLOSE_PCT = 0.60
 MOVE_SL_TO_BE = True
 
-# Soft fee-aware settings
+# SOFT FEE-AWARE SETTINGS
 TAKER_FEE_RATE = 0.00055
 MIN_NET_PROFIT_USDT = 0.003
 MIN_R_MULTIPLE = 1.0
@@ -45,12 +48,14 @@ MIN_R_MULTIPLE = 1.0
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
 
+
 # ============================================================
 # LOGGING
 # ============================================================
 def log(tag: str, msg: str) -> None:
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{now}] [{tag}] {msg}", flush=True)
+
 
 def send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID or "YOUR_" in TELEGRAM_TOKEN or "YOUR_" in CHAT_ID:
@@ -60,6 +65,7 @@ def send_telegram(msg: str) -> None:
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         log("TG_ERR", str(e))
+
 
 # ============================================================
 # AUTH
@@ -72,6 +78,7 @@ def _sign(payload: str, timestamp: str) -> str:
         hashlib.sha256
     ).hexdigest()
 
+
 def _headers(payload: str, timestamp: str) -> dict:
     return {
         "X-BAPI-API-KEY": API_KEY,
@@ -81,8 +88,9 @@ def _headers(payload: str, timestamp: str) -> dict:
         "Content-Type": "application/json",
     }
 
+
 # ============================================================
-# HTTP with retry
+# HTTP WITH RETRY
 # ============================================================
 def req(method: str, path: str, params: dict | None = None, body: dict | None = None, retries: int = 3) -> dict:
     last_err = None
@@ -124,6 +132,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
     send_telegram(f"⚠️ API ERROR\n{path}\n{last_err}")
     return {}
 
+
 # ============================================================
 # STATE
 # ============================================================
@@ -145,6 +154,7 @@ def default_state() -> dict:
         "breakeven_moved": False,
     }
 
+
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return default_state()
@@ -157,9 +167,11 @@ def load_state() -> dict:
     except Exception:
         return default_state()
 
+
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
 
 # ============================================================
 # MARKET DATA
@@ -179,6 +191,7 @@ def get_candles(symbol: str, interval: str, limit: int = 300) -> list:
         return list(reversed(r["result"]["list"]))
     return []
 
+
 def get_price(symbol: str) -> float | None:
     r = req(
         "GET",
@@ -192,6 +205,7 @@ def get_price(symbol: str) -> float | None:
         return float(r["result"]["list"][0]["lastPrice"])
     except Exception:
         return None
+
 
 def get_balance() -> float | None:
     r = req(
@@ -215,6 +229,7 @@ def get_balance() -> float | None:
         log("BALANCE_ERR", f"{e} | RAW={r}")
         return None
 
+
 def get_instrument_info(symbol: str) -> dict | None:
     r = req(
         "GET",
@@ -233,6 +248,7 @@ def get_instrument_info(symbol: str) -> dict | None:
         }
     except Exception:
         return None
+
 
 def get_open_position(symbol: str) -> dict | None:
     r = req(
@@ -259,12 +275,14 @@ def get_open_position(symbol: str) -> dict | None:
         log("POS_ERR", f"{symbol} -> {e}")
     return None
 
+
 def find_any_open_position() -> dict | None:
     for symbol in SYMBOLS:
         pos = get_open_position(symbol)
         if pos:
             return pos
     return None
+
 
 def set_leverage(symbol: str) -> None:
     body = {
@@ -279,6 +297,7 @@ def set_leverage(symbol: str) -> None:
     else:
         log("LEVERAGE", f"{symbol} -> {r.get('retMsg', r)}")
 
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -287,10 +306,12 @@ def floor_to_step(value: float, step: float) -> float:
         return value
     return math.floor(value / step) * step
 
+
 def round_price(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
     return round(round(price / tick_size) * tick_size, 8)
+
 
 def ema(values: list[float], period: int) -> float | None:
     if len(values) < period:
@@ -301,24 +322,29 @@ def ema(values: list[float], period: int) -> float | None:
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
 
+
 def iso_now() -> str:
     return datetime.now(UTC).isoformat()
+
 
 def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
     entry_notional = entry * qty
     exit_notional = exit_price * qty
     return (entry_notional * TAKER_FEE_RATE) + (exit_notional * TAKER_FEE_RATE)
 
+
 def gross_pnl(side: str, entry: float, exit_price: float, qty: float) -> float:
     if side == "Buy":
         return (exit_price - entry) * qty
     return (entry - exit_price) * qty
+
 
 def net_pnl_estimate(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float, float]:
     gross = gross_pnl(side, entry, exit_price, qty)
     fees = estimate_round_trip_fees(entry, exit_price, qty)
     net = gross - fees
     return gross, fees, net
+
 
 # ============================================================
 # STRATEGY
@@ -334,6 +360,7 @@ def find_swings(closes: list[float], lb: int = SWING_LB) -> list[tuple]:
             swings.append(("L", i, closes[i]))
     return swings
 
+
 def detect_bos(swings: list[tuple]) -> str | None:
     if len(swings) < 3:
         return None
@@ -344,6 +371,7 @@ def detect_bos(swings: list[tuple]) -> str | None:
         return "BOS_DOWN"
     return None
 
+
 def detect_choch(swings: list[tuple]) -> str | None:
     if len(swings) < 4:
         return None
@@ -353,6 +381,7 @@ def detect_choch(swings: list[tuple]) -> str | None:
     if a[0] == "L" and b[0] == "H" and c[0] == "L" and d[0] == "H" and d[2] > b[2]:
         return "LONG"
     return None
+
 
 def detect_fvg(candles: list) -> tuple | None:
     if len(candles) < 3:
@@ -369,6 +398,7 @@ def detect_fvg(candles: list) -> tuple | None:
     if c2_high < c0_low:
         return ("bear", c2_high, c0_low)
     return None
+
 
 def detect_liquidity(candles: list) -> bool:
     if len(candles) < 2:
@@ -388,6 +418,7 @@ def detect_liquidity(candles: list) -> bool:
 
     return swept_high or swept_low
 
+
 def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
     if len(candles) < period + 1:
         return 0.0
@@ -401,6 +432,7 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
         trs.append(tr)
 
     return sum(trs[-period:]) / period if trs else 0.0
+
 
 def smart_stop_loss(side: str, swings: list[tuple], current_price: float, candles: list) -> float:
     atr = calc_atr(candles)
@@ -416,6 +448,7 @@ def smart_stop_loss(side: str, swings: list[tuple], current_price: float, candle
     if len(highs) >= 1:
         return highs[-1] + atr_buffer
     return current_price * 1.02
+
 
 def scan_symbol(symbol: str) -> dict | None:
     candles_5m = get_candles(symbol, ENTRY_INTERVAL, 300)
@@ -485,6 +518,7 @@ def scan_symbol(symbol: str) -> dict | None:
         "swings": swings,
     }
 
+
 # ============================================================
 # ORDER MANAGEMENT
 # ============================================================
@@ -504,6 +538,7 @@ def build_order_qty(symbol: str, balance_usdt: float, price: float) -> float | N
 
     return round(qty, 8)
 
+
 def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
     body = {
         "category": CATEGORY,
@@ -520,6 +555,7 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
     }
     return req("POST", "/v5/order/create", body=body)
 
+
 def reduce_position(symbol: str, current_side: str, qty: float) -> dict:
     close_side = "Sell" if current_side == "Buy" else "Buy"
     body = {
@@ -532,6 +568,7 @@ def reduce_position(symbol: str, current_side: str, qty: float) -> dict:
         "reduceOnly": True,
     }
     return req("POST", "/v5/order/create", body=body)
+
 
 def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None = None) -> dict:
     body = {
@@ -546,6 +583,7 @@ def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None =
         body["takeProfit"] = str(tp)
         body["tpTriggerBy"] = "MarkPrice"
     return req("POST", "/v5/position/trading-stop", body=body)
+
 
 # ============================================================
 # DISPLAY / RESULT
@@ -574,6 +612,7 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
     print(f"Balance   : {balance_usdt:.6f} USDT")
     print("=" * 70 + "\n")
 
+
 def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None, float | None, float | None]:
     symbol = state.get("symbol")
     side = state.get("pos")
@@ -596,13 +635,18 @@ def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, f
     gross, fees, net = net_pnl_estimate(side, entry, last_price, qty)
     return reason, gross, fees, net
 
+
 # ============================================================
 # POSITION MANAGEMENT
 # ============================================================
 def manage_open_position(state: dict, actual_pos: dict) -> str:
     symbol = actual_pos["symbol"]
     side = actual_pos["side"]
-    mark = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else (get_price(symbol) or actual_pos["entry"])
+
+    last_price = get_price(symbol)
+    mark_price = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else None
+    current_price = last_price if last_price is not None else (mark_price if mark_price is not None else actual_pos["entry"])
+
     entry = float(state.get("entry") or actual_pos["entry"])
     size = float(actual_pos["size"])
     initial_risk = state.get("initial_risk")
@@ -615,14 +659,37 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
         state["entry"] = float(actual_pos["entry"])
     save_state(state)
 
-    gross_now, fees_now, net_now = net_pnl_estimate(side, entry, mark, size)
-    log("POSITION", f"{symbol} | {side} | entry={entry:.6f} now={mark:.6f} gross={gross_now:+.6f} fees={fees_now:.6f} net={net_now:+.6f}")
+    gross_now, fees_now, net_now = net_pnl_estimate(side, entry, current_price, size)
+    log(
+        "POSITION",
+        f"{symbol} | {side} | entry={entry:.6f} current={current_price:.6f} "
+        f"gross={gross_now:+.6f} fees={fees_now:.6f} net={net_now:+.6f}"
+    )
 
     if not initial_risk or initial_risk <= 0:
         return f"Position running on {symbol}"
 
-    current_r = ((mark - entry) / initial_risk) if side == "Buy" else ((entry - mark) / initial_risk)
+    current_r = ((current_price - entry) / initial_risk) if side == "Buy" else ((entry - current_price) / initial_risk)
 
+    # MOVE SL TO BREAKEVEN FIRST AT 0.5R
+    if MOVE_SL_TO_BE and not state.get("breakeven_moved") and current_r >= BE_TRIGGER_R:
+        be_sl = entry
+        r = update_trading_stop(symbol, sl=be_sl)
+        if r.get("retCode") == 0:
+            state["sl"] = be_sl
+            state["breakeven_moved"] = True
+            save_state(state)
+
+            send_telegram(
+                f"🛡️ SL MOVED TO BREAKEVEN\n"
+                f"Pair: {symbol}\n"
+                f"Side: {side}\n"
+                f"New SL: {be_sl}\n"
+                f"Triggered At: {current_r:.2f}R"
+            )
+            log("BE", f"{symbol} -> moved SL to BE at {current_r:.2f}R")
+
+    # PARTIAL AT 0.8R
     if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
         instrument = get_instrument_info(symbol)
         if instrument:
@@ -630,7 +697,7 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
             if partial_qty >= instrument["min_order_qty"] and partial_qty < size:
                 r = reduce_position(symbol, side, partial_qty)
                 if r.get("retCode") == 0:
-                    gross_part, fees_part, net_part = net_pnl_estimate(side, entry, mark, partial_qty)
+                    gross_part, fees_part, net_part = net_pnl_estimate(side, entry, current_price, partial_qty)
 
                     state["partial_taken"] = True
                     state["partial_qty"] = partial_qty
@@ -642,33 +709,19 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
                         f"Pair: {symbol}\n"
                         f"Side: {side}\n"
                         f"Entry: {entry}\n"
-                        f"Current Price: {mark}\n"
+                        f"Current Price: {current_price}\n"
                         f"Closed Qty: {partial_qty}\n"
                         f"Remaining Qty: {state['remaining_qty']}\n"
                         f"Gross Partial: {gross_part:.6f} USDT\n"
                         f"Est. Fees: {fees_part:.6f} USDT\n"
                         f"Est. Net Partial: {net_part:.6f} USDT\n"
-                        f"R Multiple: {current_r:.2f}R"
+                        f"Triggered At: {current_r:.2f}R"
                     )
 
-                    log("PARTIAL", f"{symbol} -> partial closed qty={partial_qty}")
-
-                    if MOVE_SL_TO_BE and not state.get("breakeven_moved"):
-                        be_sl = entry
-                        update_trading_stop(symbol, sl=be_sl)
-                        state["sl"] = be_sl
-                        state["breakeven_moved"] = True
-                        save_state(state)
-
-                        send_telegram(
-                            f"🛡️ SL MOVED TO BREAKEVEN\n"
-                            f"Pair: {symbol}\n"
-                            f"Side: {side}\n"
-                            f"New SL: {be_sl}"
-                        )
-                        log("BE", f"{symbol} -> moved SL to BE")
+                    log("PARTIAL", f"{symbol} -> partial closed qty={partial_qty} at {current_r:.2f}R")
 
     return f"Position running on {symbol}"
+
 
 # ============================================================
 # CORE
@@ -824,25 +877,26 @@ def run() -> str:
             f"Est. Gross TP: {gross_tp:.6f} USDT\n"
             f"Est. Fees TP: {fees_tp:.6f} USDT\n"
             f"Est. Net TP: {net_tp:.6f} USDT\n"
-            f"Partial Rule: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R"
+            f"BE: {BE_TRIGGER_R}R | Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R"
         )
 
         return f"Trade opened on {symbol}"
 
     return "No setup on any pair"
 
+
 # ============================================================
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 78)
-    log("BOT", "Bybit Bot | Soft Fee-Aware | Partial TP + BE | DOGE + HBAR + 1000PEPE")
+    log("BOT", "=" * 82)
+    log("BOT", "FINAL TEST MODE | DOGE + HBAR | Soft Fee-Aware | Fast Exit Management")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
-    log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Volume Multiplier: {VOLUME_MULTIPLIER}")
-    log("BOT", f"Taker Fee Rate: {TAKER_FEE_RATE}")
-    log("BOT", f"Min Net Profit: {MIN_NET_PROFIT_USDT} USDT | Min R: {MIN_R_MULTIPLE}")
-    log("BOT", "=" * 78)
+    log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
+    log("BOT", f"BE Trigger: {BE_TRIGGER_R}R | Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
+    log("BOT", f"Taker Fee Rate: {TAKER_FEE_RATE} | Min Net Profit: {MIN_NET_PROFIT_USDT} USDT | Min R: {MIN_R_MULTIPLE}")
+    log("BOT", "=" * 82)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
@@ -854,7 +908,9 @@ def main() -> None:
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
         f"Cooldown: {COOLDOWN_MINUTES} min\n"
-        f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
+        f"Check Interval: {CHECK_INTERVAL_SECONDS}s\n"
+        f"BE Trigger: {BE_TRIGGER_R}R\n"
+        f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
         f"Taker Fee Rate: {TAKER_FEE_RATE}\n"
         f"Min Net Profit: {MIN_NET_PROFIT_USDT} USDT\n"
         f"Min R: {MIN_R_MULTIPLE}\n"
@@ -865,11 +921,12 @@ def main() -> None:
         try:
             result = run()
             log("RUN", result)
-            time.sleep(60)
+            time.sleep(CHECK_INTERVAL_SECONDS)
         except Exception as e:
             log("ERROR", str(e))
             send_telegram(f"⚠️ BOT ERROR\n{e}")
-            time.sleep(15)
+            time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
