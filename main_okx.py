@@ -13,38 +13,37 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-BASE_URL = "https://api.bybit.com"
-STATE_FILE = "state_bybit.json"
+BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
+STATE_FILE = "state_bybit_ema_v2.json"
 
-# FINAL PAIRS ONLY
-SYMBOLS = ["DOGEUSDT", "HBARUSDT"]
+SYMBOLS = ["DOGEUSDT"]   # final clean test: DOGE only
 
 CATEGORY = "linear"
-ENTRY_INTERVAL = "5"
-TREND_INTERVAL = "60"
+
+TREND_INTERVAL = "15"    # trend filter timeframe
+ENTRY_INTERVAL = "5"     # entry timeframe
 
 LEVERAGE = 15
 POSITION_PCT = 0.10
-RR_RATIO = 1.5
-SWING_LB = 3
-ATR_PERIOD = 14
 RECV_WINDOW = "5000"
 
+# strategy
 VOLUME_MULTIPLIER = 1.10
-COOLDOWN_MINUTES = 20
+RR_RATIO = 1.50
+
+# exit management
 CHECK_INTERVAL_SECONDS = 15
-
-# FINAL EXIT SETTINGS
-BE_TRIGGER_R = 0.5
-PARTIAL_AT_R = 0.8
+COOLDOWN_MINUTES = 15
+BE_TRIGGER_R = 0.50
+PARTIAL_AT_R = 0.80
 PARTIAL_CLOSE_PCT = 0.60
-MOVE_SL_TO_BE = True
 
-# SOFT FEE-AWARE SETTINGS
+# fee-aware soft filter
 TAKER_FEE_RATE = 0.00055
 MIN_NET_PROFIT_USDT = 0.003
 MIN_R_MULTIPLE = 1.0
 
+# telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
 
@@ -139,7 +138,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 def default_state() -> dict:
     return {
         "symbol": None,
-        "pos": None,
+        "pos": None,                # Buy / Sell
         "entry": None,
         "sl": None,
         "tp": None,
@@ -196,10 +195,7 @@ def get_price(symbol: str) -> float | None:
     r = req(
         "GET",
         "/v5/market/tickers",
-        params={
-            "category": CATEGORY,
-            "symbol": symbol,
-        },
+        params={"category": CATEGORY, "symbol": symbol},
     )
     try:
         return float(r["result"]["list"][0]["lastPrice"])
@@ -211,10 +207,7 @@ def get_balance() -> float | None:
     r = req(
         "GET",
         "/v5/account/wallet-balance",
-        params={
-            "accountType": "UNIFIED",
-            "coin": "USDT",
-        },
+        params={"accountType": "UNIFIED", "coin": "USDT"},
     )
     try:
         coin_list = r["result"]["list"][0]["coin"]
@@ -234,10 +227,7 @@ def get_instrument_info(symbol: str) -> dict | None:
     r = req(
         "GET",
         "/v5/market/instruments-info",
-        params={
-            "category": CATEGORY,
-            "symbol": symbol,
-        },
+        params={"category": CATEGORY, "symbol": symbol},
     )
     try:
         info = r["result"]["list"][0]
@@ -254,10 +244,7 @@ def get_open_position(symbol: str) -> dict | None:
     r = req(
         "GET",
         "/v5/position/list",
-        params={
-            "category": CATEGORY,
-            "symbol": symbol,
-        },
+        params={"category": CATEGORY, "symbol": symbol},
     )
     try:
         for pos in r["result"]["list"]:
@@ -313,18 +300,27 @@ def round_price(price: float, tick_size: float) -> float:
     return round(round(price / tick_size) * tick_size, 8)
 
 
-def ema(values: list[float], period: int) -> float | None:
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
-
-
 def iso_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def ema_series(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def macd_series(values: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = ema_series(values, fast)
+    ema_slow = ema_series(values, slow)
+    macd = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema_series(macd, signal)
+    hist = [m - s for m, s in zip(macd, signal_line)]
+    return macd, signal_line, hist
 
 
 def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
@@ -346,80 +342,7 @@ def net_pnl_estimate(side: str, entry: float, exit_price: float, qty: float) -> 
     return gross, fees, net
 
 
-# ============================================================
-# STRATEGY
-# ============================================================
-def find_swings(closes: list[float], lb: int = SWING_LB) -> list[tuple]:
-    swings = []
-    for i in range(lb, len(closes) - lb):
-        is_high = all(closes[i] > closes[i - j] and closes[i] > closes[i + j] for j in range(1, lb + 1))
-        is_low = all(closes[i] < closes[i - j] and closes[i] < closes[i + j] for j in range(1, lb + 1))
-        if is_high:
-            swings.append(("H", i, closes[i]))
-        elif is_low:
-            swings.append(("L", i, closes[i]))
-    return swings
-
-
-def detect_bos(swings: list[tuple]) -> str | None:
-    if len(swings) < 3:
-        return None
-    a, b, c = swings[-3], swings[-2], swings[-1]
-    if b[0] == "L" and c[0] == "H" and c[2] > a[2]:
-        return "BOS_UP"
-    if b[0] == "H" and c[0] == "L" and c[2] < a[2]:
-        return "BOS_DOWN"
-    return None
-
-
-def detect_choch(swings: list[tuple]) -> str | None:
-    if len(swings) < 4:
-        return None
-    a, b, c, d = swings[-4], swings[-3], swings[-2], swings[-1]
-    if a[0] == "H" and b[0] == "L" and c[0] == "H" and d[0] == "L" and d[2] < b[2]:
-        return "SHORT"
-    if a[0] == "L" and b[0] == "H" and c[0] == "L" and d[0] == "H" and d[2] > b[2]:
-        return "LONG"
-    return None
-
-
-def detect_fvg(candles: list) -> tuple | None:
-    if len(candles) < 3:
-        return None
-    c0, c2 = candles[-3], candles[-1]
-
-    c0_high = float(c0[2])
-    c0_low = float(c0[3])
-    c2_high = float(c2[2])
-    c2_low = float(c2[3])
-
-    if c2_low > c0_high:
-        return ("bull", c0_high, c2_low)
-    if c2_high < c0_low:
-        return ("bear", c2_high, c0_low)
-    return None
-
-
-def detect_liquidity(candles: list) -> bool:
-    if len(candles) < 2:
-        return False
-
-    last = candles[-1]
-    prev = candles[-2]
-
-    last_high = float(last[2])
-    last_low = float(last[3])
-    prev_high = float(prev[2])
-    prev_low = float(prev[3])
-    last_close = float(last[4])
-
-    swept_high = (last_high > prev_high) and (last_close < prev_high)
-    swept_low = (last_low < prev_low) and (last_close > prev_low)
-
-    return swept_high or swept_low
-
-
-def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
+def atr(candles: list, period: int = 14) -> float:
     if len(candles) < period + 1:
         return 0.0
 
@@ -434,88 +357,112 @@ def calc_atr(candles: list, period: int = ATR_PERIOD) -> float:
     return sum(trs[-period:]) / period if trs else 0.0
 
 
-def smart_stop_loss(side: str, swings: list[tuple], current_price: float, candles: list) -> float:
-    atr = calc_atr(candles)
-    atr_buffer = atr * 0.5 if atr > 0 else 0
-
-    if side == "Buy":
-        lows = [s[2] for s in swings if s[0] == "L"]
-        if len(lows) >= 1:
-            return lows[-1] - atr_buffer
-        return current_price * 0.98
-
-    highs = [s[2] for s in swings if s[0] == "H"]
-    if len(highs) >= 1:
-        return highs[-1] + atr_buffer
-    return current_price * 1.02
-
-
+# ============================================================
+# SIGNAL LOGIC
+# ============================================================
 def scan_symbol(symbol: str) -> dict | None:
-    candles_5m = get_candles(symbol, ENTRY_INTERVAL, 300)
-    candles_1h = get_candles(symbol, TREND_INTERVAL, 250)
+    candles_5m_raw = get_candles(symbol, ENTRY_INTERVAL, 300)
+    candles_15m_raw = get_candles(symbol, TREND_INTERVAL, 300)
 
-    if not candles_5m or not candles_1h:
-        log("SCAN", f"{symbol} -> missing candles")
+    if len(candles_5m_raw) < 80 or len(candles_15m_raw) < 80:
+        log("SCAN", f"{symbol} -> insufficient candles")
         return None
 
-    price = get_price(symbol)
-    if not price:
-        log("SCAN", f"{symbol} -> no price")
-        return None
+    # Exclude current forming candle
+    candles_5m = candles_5m_raw[:-1]
+    candles_15m = candles_15m_raw[:-1]
 
     closes_5m = [float(c[4]) for c in candles_5m]
-    closes_1h = [float(c[4]) for c in candles_1h]
+    closes_15m = [float(c[4]) for c in candles_15m]
+    highs_5m = [float(c[2]) for c in candles_5m]
+    lows_5m = [float(c[3]) for c in candles_5m]
+    vols_5m = [float(c[5]) for c in candles_5m]
+    opens_5m = [float(c[1]) for c in candles_5m]
 
-    swings = find_swings(closes_5m)
-    bos = detect_bos(swings)
-    choch = detect_choch(swings)
-    fvg = detect_fvg(candles_5m)
-    liq = detect_liquidity(candles_5m)
+    # 15m trend filter
+    ema21_15 = ema_series(closes_15m, 21)
+    ema55_15 = ema_series(closes_15m, 55)
 
-    ema200 = ema(closes_1h, 200)
-    trend_up = ema200 is not None and price > ema200
-    trend_down = ema200 is not None and price < ema200
+    trend_up = ema21_15[-1] > ema55_15[-1]
+    trend_down = ema21_15[-1] < ema55_15[-1]
 
-    volumes = [float(c[5]) for c in candles_5m[-20:]]
-    avg_vol = sum(volumes[:-1]) / max(len(volumes[:-1]), 1) if len(volumes) > 1 else 0
-    current_vol = volumes[-1] if volumes else 0
-    volume_surge = current_vol > avg_vol * VOLUME_MULTIPLIER if avg_vol > 0 else False
+    # 5m EMA stack
+    ema9 = ema_series(closes_5m, 9)
+    ema13 = ema_series(closes_5m, 13)
+    ema21 = ema_series(closes_5m, 21)
+    ema55 = ema_series(closes_5m, 55)
+
+    macd_line, macd_signal, macd_hist = macd_series(closes_5m)
+
+    # signal candle = last closed 5m candle
+    i = -1
+    p = -2  # previous candle
+
+    price = closes_5m[i]
+
+    stacked_up = ema9[i] > ema13[i] > ema21[i] > ema55[i]
+    stacked_down = ema9[i] < ema13[i] < ema21[i] < ema55[i]
+
+    macd_up = macd_line[i] > macd_signal[i] and macd_hist[i] > 0
+    macd_down = macd_line[i] < macd_signal[i] and macd_hist[i] < 0
+
+    avg_vol = sum(vols_5m[-21:-1]) / 20 if len(vols_5m) >= 21 else 0
+    volume_ok = vols_5m[i] > avg_vol * VOLUME_MULTIPLIER if avg_vol > 0 else False
+
+    # Pullback into EMA13/21 zone on previous candle
+    pullback_long = lows_5m[p] <= ema13[p] or lows_5m[p] <= ema21[p]
+    pullback_short = highs_5m[p] >= ema13[p] or highs_5m[p] >= ema21[p]
+
+    # Resume candle
+    bullish_resume = closes_5m[i] > opens_5m[i] and closes_5m[i] > highs_5m[p] and closes_5m[i] > ema9[i]
+    bearish_resume = closes_5m[i] < opens_5m[i] and closes_5m[i] < lows_5m[p] and closes_5m[i] < ema9[i]
 
     log(
-        "SMC",
-        f"{symbol} | BOS={bos} | CHOCH={choch} | FVG={fvg[0] if fvg else None} | "
-        f"Liq={liq} | Vol={volume_surge} | TrendUp={trend_up} | TrendDown={trend_down}"
+        "SETUP",
+        f"{symbol} | trend_up={trend_up} trend_down={trend_down} | "
+        f"stack_up={stacked_up} stack_down={stacked_down} | "
+        f"macd_up={macd_up} macd_down={macd_down} | "
+        f"vol={volume_ok} | pb_long={pullback_long} pb_short={pullback_short} | "
+        f"bull_resume={bullish_resume} bear_resume={bearish_resume}"
     )
 
     side = None
     reason = None
 
-    if trend_up and liq and volume_surge:
-        if choch == "LONG" and fvg and fvg[0] == "bull":
-            side = "Buy"
-            reason = "HTF UP + CHOCH LONG + BULL FVG + LIQ + VOL"
-        elif bos == "BOS_UP" and (fvg is None or fvg[0] == "bull"):
-            side = "Buy"
-            reason = "HTF UP + BOS UP + LIQ + VOL"
+    if trend_up and stacked_up and macd_up and volume_ok and pullback_long and bullish_resume:
+        side = "Buy"
+        reason = "EMA STACK LONG + MACD + VOL + PULLBACK RESUME"
 
-    elif trend_down and liq and volume_surge:
-        if choch == "SHORT" and fvg and fvg[0] == "bear":
-            side = "Sell"
-            reason = "HTF DOWN + CHOCH SHORT + BEAR FVG + LIQ + VOL"
-        elif bos == "BOS_DOWN" and (fvg is None or fvg[0] == "bear"):
-            side = "Sell"
-            reason = "HTF DOWN + BOS DOWN + LIQ + VOL"
+    elif trend_down and stacked_down and macd_down and volume_ok and pullback_short and bearish_resume:
+        side = "Sell"
+        reason = "EMA STACK SHORT + MACD + VOL + PULLBACK RESUME"
 
     if not side:
         return None
+
+    signal_atr = atr(candles_5m, ATR_PERIOD)
+
+    if side == "Buy":
+        recent_low = min(lows_5m[-6:])
+        sl = recent_low - (signal_atr * 0.20)
+        if sl >= price:
+            return None
+        tp = price + (abs(price - sl) * RR_RATIO)
+
+    else:
+        recent_high = max(highs_5m[-6:])
+        sl = recent_high + (signal_atr * 0.20)
+        if sl <= price:
+            return None
+        tp = price - (abs(price - sl) * RR_RATIO)
 
     return {
         "symbol": symbol,
         "side": side,
         "reason": reason,
         "price": price,
-        "candles": candles_5m,
-        "swings": swings,
+        "sl": sl,
+        "tp": tp,
     }
 
 
@@ -592,12 +539,11 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
     risk_usdt = abs(entry - sl) * qty
     gross_tp, fees_tp, net_tp = net_pnl_estimate(side, entry, tp, qty)
     risk_pct = (risk_usdt / balance_usdt * 100) if balance_usdt else 0
-
     direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print(action)
-    print("=" * 70)
+    print("=" * 72)
     print(f"Pair      : {symbol}")
     print(f"Direction : {direction}")
     print(f"Entry     : {entry:.6f}")
@@ -610,7 +556,7 @@ def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: f
     print(f"Est Fees  : {fees_tp:.6f} USDT")
     print(f"Est Net   : {net_tp:.6f} USDT")
     print(f"Balance   : {balance_usdt:.6f} USDT")
-    print("=" * 70 + "\n")
+    print("=" * 72 + "\n")
 
 
 def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None, float | None, float | None]:
@@ -671,8 +617,8 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
 
     current_r = ((current_price - entry) / initial_risk) if side == "Buy" else ((entry - current_price) / initial_risk)
 
-    # MOVE SL TO BREAKEVEN FIRST AT 0.5R
-    if MOVE_SL_TO_BE and not state.get("breakeven_moved") and current_r >= BE_TRIGGER_R:
+    # BE at 0.5R
+    if not state.get("breakeven_moved") and current_r >= BE_TRIGGER_R:
         be_sl = entry
         r = update_trading_stop(symbol, sl=be_sl)
         if r.get("retCode") == 0:
@@ -689,7 +635,7 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
             )
             log("BE", f"{symbol} -> moved SL to BE at {current_r:.2f}R")
 
-    # PARTIAL AT 0.8R
+    # partial at 0.8R
     if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
         instrument = get_instrument_info(symbol)
         if instrument:
@@ -734,6 +680,7 @@ def run() -> str:
     if actual_pos:
         return manage_open_position(state, actual_pos)
 
+    # position closed after previous state
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
@@ -769,6 +716,7 @@ def run() -> str:
         save_state(new_state)
         state = new_state
 
+    # cooldown
     if state.get("last_closed_at"):
         elapsed = now_ts - float(state["last_closed_at"])
         cooldown_sec = COOLDOWN_MINUTES * 60
@@ -788,36 +736,22 @@ def run() -> str:
         price = setup["price"]
         side = setup["side"]
         reason = setup["reason"]
-        candles = setup["candles"]
-        swings = setup["swings"]
-
         instrument = get_instrument_info(symbol)
         if not instrument:
             continue
 
-        qty = build_order_qty(symbol, balance_usdt, price)
-        if qty is None or qty <= 0:
-            continue
-
-        sl = smart_stop_loss(side, swings, price, candles)
-
-        if side == "Buy":
-            if sl >= price:
-                sl = price * 0.995
-            tp = price + (abs(price - sl) * RR_RATIO)
-        else:
-            if sl <= price:
-                sl = price * 1.005
-            tp = price - (abs(price - sl) * RR_RATIO)
-
-        sl = round_price(sl, instrument["tick_size"])
-        tp = round_price(tp, instrument["tick_size"])
+        sl = round_price(setup["sl"], instrument["tick_size"])
+        tp = round_price(setup["tp"], instrument["tick_size"])
 
         if sl <= 0 or tp <= 0:
             continue
 
         initial_risk = abs(price - sl)
         if initial_risk <= 0:
+            continue
+
+        qty = build_order_qty(symbol, balance_usdt, price)
+        if qty is None or qty <= 0:
             continue
 
         gross_tp, fees_tp, net_tp = net_pnl_estimate(side, price, tp, qty)
@@ -882,38 +816,39 @@ def run() -> str:
 
         return f"Trade opened on {symbol}"
 
-    return "No setup on any pair"
+    return "No setup"
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main() -> None:
-    log("BOT", "=" * 82)
-    log("BOT", "FINAL TEST MODE | DOGE + HBAR | Soft Fee-Aware | Fast Exit Management")
+    log("BOT", "=" * 84)
+    log("BOT", "EMA V2 FINAL TEST | DOGE ONLY | EMA 9/13/21/55 + MACD + VOLUME")
+    log("BOT", f"Base URL: {BASE_URL}")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
+    log("BOT", f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
     log("BOT", f"BE Trigger: {BE_TRIGGER_R}R | Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
     log("BOT", f"Taker Fee Rate: {TAKER_FEE_RATE} | Min Net Profit: {MIN_NET_PROFIT_USDT} USDT | Min R: {MIN_R_MULTIPLE}")
-    log("BOT", "=" * 82)
+    log("BOT", "=" * 84)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
         time.sleep(0.3)
 
     send_telegram(
-        f"🤖 BOT STARTED\n"
+        f"🤖 EMA V2 BOT STARTED\n"
         f"Pairs: {', '.join(SYMBOLS)}\n"
+        f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
         f"Leverage: {LEVERAGE}x\n"
         f"Cooldown: {COOLDOWN_MINUTES} min\n"
         f"Check Interval: {CHECK_INTERVAL_SECONDS}s\n"
         f"BE Trigger: {BE_TRIGGER_R}R\n"
         f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
-        f"Taker Fee Rate: {TAKER_FEE_RATE}\n"
-        f"Min Net Profit: {MIN_NET_PROFIT_USDT} USDT\n"
-        f"Min R: {MIN_R_MULTIPLE}\n"
+        f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
         f"Mode: 1 active trade only"
     )
 
