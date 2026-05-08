@@ -13,10 +13,12 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
+VERSION = "EMA_V2_DOGE_ONLY_FINAL_02"
+
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_bybit_ema_v2.json"
 
-SYMBOLS = ["DOGEUSDT"]   # final clean test: DOGE only
+SYMBOLS = ["DOGEUSDT"]   # final clean test
 
 CATEGORY = "linear"
 
@@ -26,24 +28,22 @@ ENTRY_INTERVAL = "5"     # entry timeframe
 LEVERAGE = 15
 POSITION_PCT = 0.10
 RECV_WINDOW = "5000"
+ATR_PERIOD = 14
 
-# strategy
 VOLUME_MULTIPLIER = 1.10
 RR_RATIO = 1.50
 
-# exit management
 CHECK_INTERVAL_SECONDS = 15
 COOLDOWN_MINUTES = 15
+
 BE_TRIGGER_R = 0.50
 PARTIAL_AT_R = 0.80
 PARTIAL_CLOSE_PCT = 0.60
 
-# fee-aware soft filter
 TAKER_FEE_RATE = 0.00055
 MIN_NET_PROFIT_USDT = 0.003
 MIN_R_MULTIPLE = 1.0
 
-# telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
 
@@ -138,7 +138,7 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 def default_state() -> dict:
     return {
         "symbol": None,
-        "pos": None,                # Buy / Sell
+        "pos": None,
         "entry": None,
         "sl": None,
         "tp": None,
@@ -368,7 +368,7 @@ def scan_symbol(symbol: str) -> dict | None:
         log("SCAN", f"{symbol} -> insufficient candles")
         return None
 
-    # Exclude current forming candle
+    # current forming candle exclude
     candles_5m = candles_5m_raw[:-1]
     candles_15m = candles_15m_raw[:-1]
 
@@ -379,14 +379,14 @@ def scan_symbol(symbol: str) -> dict | None:
     vols_5m = [float(c[5]) for c in candles_5m]
     opens_5m = [float(c[1]) for c in candles_5m]
 
-    # 15m trend filter
+    # trend on 15m
     ema21_15 = ema_series(closes_15m, 21)
     ema55_15 = ema_series(closes_15m, 55)
 
     trend_up = ema21_15[-1] > ema55_15[-1]
     trend_down = ema21_15[-1] < ema55_15[-1]
 
-    # 5m EMA stack
+    # 5m setup
     ema9 = ema_series(closes_5m, 9)
     ema13 = ema_series(closes_5m, 13)
     ema21 = ema_series(closes_5m, 21)
@@ -394,9 +394,8 @@ def scan_symbol(symbol: str) -> dict | None:
 
     macd_line, macd_signal, macd_hist = macd_series(closes_5m)
 
-    # signal candle = last closed 5m candle
     i = -1
-    p = -2  # previous candle
+    p = -2
 
     price = closes_5m[i]
 
@@ -409,11 +408,9 @@ def scan_symbol(symbol: str) -> dict | None:
     avg_vol = sum(vols_5m[-21:-1]) / 20 if len(vols_5m) >= 21 else 0
     volume_ok = vols_5m[i] > avg_vol * VOLUME_MULTIPLIER if avg_vol > 0 else False
 
-    # Pullback into EMA13/21 zone on previous candle
     pullback_long = lows_5m[p] <= ema13[p] or lows_5m[p] <= ema21[p]
     pullback_short = highs_5m[p] >= ema13[p] or highs_5m[p] >= ema21[p]
 
-    # Resume candle
     bullish_resume = closes_5m[i] > opens_5m[i] and closes_5m[i] > highs_5m[p] and closes_5m[i] > ema9[i]
     bearish_resume = closes_5m[i] < opens_5m[i] and closes_5m[i] < lows_5m[p] and closes_5m[i] < ema9[i]
 
@@ -448,7 +445,6 @@ def scan_symbol(symbol: str) -> dict | None:
         if sl >= price:
             return None
         tp = price + (abs(price - sl) * RR_RATIO)
-
     else:
         recent_high = max(highs_5m[-6:])
         sl = recent_high + (signal_atr * 0.20)
@@ -617,7 +613,7 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
 
     current_r = ((current_price - entry) / initial_risk) if side == "Buy" else ((entry - current_price) / initial_risk)
 
-    # BE at 0.5R
+    # move SL to BE at 0.5R
     if not state.get("breakeven_moved") and current_r >= BE_TRIGGER_R:
         be_sl = entry
         r = update_trading_stop(symbol, sl=be_sl)
@@ -680,7 +676,7 @@ def run() -> str:
     if actual_pos:
         return manage_open_position(state, actual_pos)
 
-    # position closed after previous state
+    # if position just closed
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
@@ -736,6 +732,7 @@ def run() -> str:
         price = setup["price"]
         side = setup["side"]
         reason = setup["reason"]
+
         instrument = get_instrument_info(symbol)
         if not instrument:
             continue
@@ -823,6 +820,8 @@ def run() -> str:
 # MAIN
 # ============================================================
 def main() -> None:
+    log("VERSION", VERSION)
+    log("CONFIG", f"ATR_PERIOD={ATR_PERIOD}")
     log("BOT", "=" * 84)
     log("BOT", "EMA V2 FINAL TEST | DOGE ONLY | EMA 9/13/21/55 + MACD + VOLUME")
     log("BOT", f"Base URL: {BASE_URL}")
@@ -840,6 +839,7 @@ def main() -> None:
 
     send_telegram(
         f"🤖 EMA V2 BOT STARTED\n"
+        f"Version: {VERSION}\n"
         f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
         f"Wallet: {int(POSITION_PCT * 100)}%\n"
@@ -849,6 +849,7 @@ def main() -> None:
         f"BE Trigger: {BE_TRIGGER_R}R\n"
         f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
         f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
+        f"ATR_PERIOD: {ATR_PERIOD}\n"
         f"Mode: 1 active trade only"
     )
 
