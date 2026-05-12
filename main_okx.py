@@ -13,36 +13,38 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "EMA_V2_DOGE_ONLY_FINAL_02"
+VERSION = "DOGE_V3_PULLBACK_RECLAIM_01"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
-STATE_FILE = "state_bybit_ema_v2.json"
+STATE_FILE = "state_bybit_v3_reclaim.json"
 
-SYMBOLS = ["DOGEUSDT"]   # final clean test
-
+SYMBOLS = ["DOGEUSDT"]
 CATEGORY = "linear"
 
-TREND_INTERVAL = "15"    # trend filter timeframe
-ENTRY_INTERVAL = "5"     # entry timeframe
+TREND_INTERVAL = "60"   # 1h trend
+ENTRY_INTERVAL = "5"    # 5m entry
 
 LEVERAGE = 15
 POSITION_PCT = 0.10
 RECV_WINDOW = "5000"
-ATR_PERIOD = 14
 
-VOLUME_MULTIPLIER = 1.10
+ATR_PERIOD = 14
 RR_RATIO = 1.50
 
 CHECK_INTERVAL_SECONDS = 15
 COOLDOWN_MINUTES = 15
 
 BE_TRIGGER_R = 0.50
-PARTIAL_AT_R = 0.80
-PARTIAL_CLOSE_PCT = 0.60
+PARTIAL_AT_R = 1.00
+PARTIAL_CLOSE_PCT = 0.50
 
 TAKER_FEE_RATE = 0.00055
 MIN_NET_PROFIT_USDT = 0.003
 MIN_R_MULTIPLE = 1.0
+
+# same-zone re-entry block
+REENTRY_BLOCK_MINUTES = 120
+REENTRY_ZONE_ATR_MULT = 0.75
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
 CHAT_ID = os.getenv("CHAT_ID", "1118069943")
@@ -146,6 +148,9 @@ def default_state() -> dict:
         "reason": None,
         "opened": None,
         "last_closed_at": None,
+        "last_closed_symbol": None,
+        "last_closed_side": None,
+        "last_closed_price": None,
         "initial_risk": None,
         "partial_taken": False,
         "partial_qty": None,
@@ -314,15 +319,6 @@ def ema_series(values: list[float], period: int) -> list[float]:
     return out
 
 
-def macd_series(values: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = ema_series(values, fast)
-    ema_slow = ema_series(values, slow)
-    macd = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal_line = ema_series(macd, signal)
-    hist = [m - s for m, s in zip(macd, signal_line)]
-    return macd, signal_line, hist
-
-
 def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
     entry_notional = entry * qty
     exit_notional = exit_price * qty
@@ -362,95 +358,98 @@ def atr(candles: list, period: int = 14) -> float:
 # ============================================================
 def scan_symbol(symbol: str) -> dict | None:
     candles_5m_raw = get_candles(symbol, ENTRY_INTERVAL, 300)
-    candles_15m_raw = get_candles(symbol, TREND_INTERVAL, 300)
+    candles_1h_raw = get_candles(symbol, TREND_INTERVAL, 300)
 
-    if len(candles_5m_raw) < 80 or len(candles_15m_raw) < 80:
+    if len(candles_5m_raw) < 80 or len(candles_1h_raw) < 220:
         log("SCAN", f"{symbol} -> insufficient candles")
         return None
 
-    # current forming candle exclude
+    # exclude current forming candles
     candles_5m = candles_5m_raw[:-1]
-    candles_15m = candles_15m_raw[:-1]
+    candles_1h = candles_1h_raw[:-1]
 
     closes_5m = [float(c[4]) for c in candles_5m]
-    closes_15m = [float(c[4]) for c in candles_15m]
     highs_5m = [float(c[2]) for c in candles_5m]
     lows_5m = [float(c[3]) for c in candles_5m]
-    vols_5m = [float(c[5]) for c in candles_5m]
     opens_5m = [float(c[1]) for c in candles_5m]
 
-    # trend on 15m
-    ema21_15 = ema_series(closes_15m, 21)
-    ema55_15 = ema_series(closes_15m, 55)
+    closes_1h = [float(c[4]) for c in candles_1h]
 
-    trend_up = ema21_15[-1] > ema55_15[-1]
-    trend_down = ema21_15[-1] < ema55_15[-1]
+    price = closes_5m[-1]
 
-    # 5m setup
-    ema9 = ema_series(closes_5m, 9)
-    ema13 = ema_series(closes_5m, 13)
-    ema21 = ema_series(closes_5m, 21)
-    ema55 = ema_series(closes_5m, 55)
+    # 1h trend filter
+    ema200_1h = ema_series(closes_1h, 200)
+    trend_up = closes_1h[-1] > ema200_1h[-1]
+    trend_down = closes_1h[-1] < ema200_1h[-1]
 
-    macd_line, macd_signal, macd_hist = macd_series(closes_5m)
+    # 5m structure
+    ema20_5m = ema_series(closes_5m, 20)
+    ema50_5m = ema_series(closes_5m, 50)
 
     i = -1
     p = -2
 
-    price = closes_5m[i]
+    ema20_now = ema20_5m[i]
+    ema20_prev = ema20_5m[p]
+    ema50_now = ema50_5m[i]
+    ema50_prev = ema50_5m[p]
 
-    stacked_up = ema9[i] > ema13[i] > ema21[i] > ema55[i]
-    stacked_down = ema9[i] < ema13[i] < ema21[i] < ema55[i]
+    bull_micro = ema20_now > ema50_now
+    bear_micro = ema20_now < ema50_now
 
-    macd_up = macd_line[i] > macd_signal[i] and macd_hist[i] > 0
-    macd_down = macd_line[i] < macd_signal[i] and macd_hist[i] < 0
+    # previous candle pullback into EMA20 zone
+    pullback_long = lows_5m[p] <= ema20_prev
+    pullback_short = highs_5m[p] >= ema20_prev
 
-    avg_vol = sum(vols_5m[-21:-1]) / 20 if len(vols_5m) >= 21 else 0
-    volume_ok = vols_5m[i] > avg_vol * VOLUME_MULTIPLIER if avg_vol > 0 else False
+    # reclaim candle on last closed candle
+    bullish_reclaim = (
+        closes_5m[i] > opens_5m[i]
+        and closes_5m[i] > ema20_now
+        and closes_5m[i] > highs_5m[p]
+    )
 
-    pullback_long = lows_5m[p] <= ema13[p] or lows_5m[p] <= ema21[p]
-    pullback_short = highs_5m[p] >= ema13[p] or highs_5m[p] >= ema21[p]
+    bearish_reclaim = (
+        closes_5m[i] < opens_5m[i]
+        and closes_5m[i] < ema20_now
+        and closes_5m[i] < lows_5m[p]
+    )
 
-    bullish_resume = closes_5m[i] > opens_5m[i] and closes_5m[i] > highs_5m[p] and closes_5m[i] > ema9[i]
-    bearish_resume = closes_5m[i] < opens_5m[i] and closes_5m[i] < lows_5m[p] and closes_5m[i] < ema9[i]
+    signal_atr = atr(candles_5m, ATR_PERIOD)
 
     log(
         "SETUP",
         f"{symbol} | trend_up={trend_up} trend_down={trend_down} | "
-        f"stack_up={stacked_up} stack_down={stacked_down} | "
-        f"macd_up={macd_up} macd_down={macd_down} | "
-        f"vol={volume_ok} | pb_long={pullback_long} pb_short={pullback_short} | "
-        f"bull_resume={bullish_resume} bear_resume={bearish_resume}"
+        f"bull_micro={bull_micro} bear_micro={bear_micro} | "
+        f"pb_long={pullback_long} pb_short={pullback_short} | "
+        f"bull_reclaim={bullish_reclaim} bear_reclaim={bearish_reclaim} | "
+        f"ema20={ema20_now:.6f} ema50={ema50_now:.6f} atr={signal_atr:.6f}"
     )
 
     side = None
     reason = None
+    sl = None
+    tp = None
 
-    if trend_up and stacked_up and macd_up and volume_ok and pullback_long and bullish_resume:
+    if trend_up and bull_micro and pullback_long and bullish_reclaim:
         side = "Buy"
-        reason = "EMA STACK LONG + MACD + VOL + PULLBACK RESUME"
-
-    elif trend_down and stacked_down and macd_down and volume_ok and pullback_short and bearish_resume:
-        side = "Sell"
-        reason = "EMA STACK SHORT + MACD + VOL + PULLBACK RESUME"
-
-    if not side:
-        return None
-
-    signal_atr = atr(candles_5m, ATR_PERIOD)
-
-    if side == "Buy":
+        reason = "1H EMA200 UP + 5M PULLBACK RECLAIM LONG"
         recent_low = min(lows_5m[-6:])
         sl = recent_low - (signal_atr * 0.20)
         if sl >= price:
             return None
         tp = price + (abs(price - sl) * RR_RATIO)
-    else:
+
+    elif trend_down and bear_micro and pullback_short and bearish_reclaim:
+        side = "Sell"
+        reason = "1H EMA200 DOWN + 5M PULLBACK RECLAIM SHORT"
         recent_high = max(highs_5m[-6:])
         sl = recent_high + (signal_atr * 0.20)
         if sl <= price:
             return None
         tp = price - (abs(price - sl) * RR_RATIO)
+
+    if not side:
+        return None
 
     return {
         "symbol": symbol,
@@ -459,6 +458,7 @@ def scan_symbol(symbol: str) -> dict | None:
         "price": price,
         "sl": sl,
         "tp": tp,
+        "atr": signal_atr,
     }
 
 
@@ -613,7 +613,7 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
 
     current_r = ((current_price - entry) / initial_risk) if side == "Buy" else ((entry - current_price) / initial_risk)
 
-    # move SL to BE at 0.5R
+    # BE at 0.5R
     if not state.get("breakeven_moved") and current_r >= BE_TRIGGER_R:
         be_sl = entry
         r = update_trading_stop(symbol, sl=be_sl)
@@ -631,7 +631,7 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
             )
             log("BE", f"{symbol} -> moved SL to BE at {current_r:.2f}R")
 
-    # partial at 0.8R
+    # partial at 1R
     if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
         instrument = get_instrument_info(symbol)
         if instrument:
@@ -676,7 +676,7 @@ def run() -> str:
     if actual_pos:
         return manage_open_position(state, actual_pos)
 
-    # if position just closed
+    # position just closed
     if state.get("pos"):
         symbol = state.get("symbol")
         last_price = get_price(symbol) if symbol else None
@@ -709,10 +709,13 @@ def run() -> str:
 
         new_state = default_state()
         new_state["last_closed_at"] = now_ts
+        new_state["last_closed_symbol"] = state.get("symbol")
+        new_state["last_closed_side"] = state.get("pos")
+        new_state["last_closed_price"] = last_price
         save_state(new_state)
         state = new_state
 
-    # cooldown
+    # cooldown after any close
     if state.get("last_closed_at"):
         elapsed = now_ts - float(state["last_closed_at"])
         cooldown_sec = COOLDOWN_MINUTES * 60
@@ -732,6 +735,7 @@ def run() -> str:
         price = setup["price"]
         side = setup["side"]
         reason = setup["reason"]
+        signal_atr = setup["atr"]
 
         instrument = get_instrument_info(symbol)
         if not instrument:
@@ -750,6 +754,23 @@ def run() -> str:
         qty = build_order_qty(symbol, balance_usdt, price)
         if qty is None or qty <= 0:
             continue
+
+        # same-zone re-entry block
+        if (
+            state.get("last_closed_symbol") == symbol
+            and state.get("last_closed_side") == side
+            and state.get("last_closed_price") is not None
+            and state.get("last_closed_at") is not None
+        ):
+            elapsed_close = now_ts - float(state["last_closed_at"])
+            if elapsed_close <= REENTRY_BLOCK_MINUTES * 60:
+                if abs(price - float(state["last_closed_price"])) <= signal_atr * REENTRY_ZONE_ATR_MULT:
+                    log(
+                        "REENTRY_SKIP",
+                        f"{symbol} {side} skipped near same zone | "
+                        f"price={price:.6f} last_close={float(state['last_closed_price']):.6f} atr={signal_atr:.6f}"
+                    )
+                    continue
 
         gross_tp, fees_tp, net_tp = net_pnl_estimate(side, price, tp, qty)
         r_multiple = abs(tp - price) / initial_risk if initial_risk > 0 else 0
@@ -822,23 +843,23 @@ def run() -> str:
 def main() -> None:
     log("VERSION", VERSION)
     log("CONFIG", f"ATR_PERIOD={ATR_PERIOD}")
-    log("BOT", "=" * 84)
-    log("BOT", "EMA V2 FINAL TEST | DOGE ONLY | EMA 9/13/21/55 + MACD + VOLUME")
+    log("BOT", "=" * 86)
+    log("BOT", "DOGE V3 | 1H EMA200 TREND + 5M PULLBACK RECLAIM | SIMPLE MODE")
     log("BOT", f"Base URL: {BASE_URL}")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m")
     log("BOT", f"Wallet Usage: {int(POSITION_PCT * 100)}% | Leverage: {LEVERAGE}x | RR: 1:{RR_RATIO}")
     log("BOT", f"Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
     log("BOT", f"BE Trigger: {BE_TRIGGER_R}R | Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
-    log("BOT", f"Taker Fee Rate: {TAKER_FEE_RATE} | Min Net Profit: {MIN_NET_PROFIT_USDT} USDT | Min R: {MIN_R_MULTIPLE}")
-    log("BOT", "=" * 84)
+    log("BOT", f"Reentry Block: {REENTRY_BLOCK_MINUTES} min | Zone ATR Mult: {REENTRY_ZONE_ATR_MULT}")
+    log("BOT", "=" * 86)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
         time.sleep(0.3)
 
     send_telegram(
-        f"🤖 EMA V2 BOT STARTED\n"
+        f"🤖 DOGE V3 BOT STARTED\n"
         f"Version: {VERSION}\n"
         f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
@@ -848,7 +869,6 @@ def main() -> None:
         f"Check Interval: {CHECK_INTERVAL_SECONDS}s\n"
         f"BE Trigger: {BE_TRIGGER_R}R\n"
         f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
-        f"Volume Multiplier: {VOLUME_MULTIPLIER}\n"
         f"ATR_PERIOD: {ATR_PERIOD}\n"
         f"Mode: 1 active trade only"
     )
