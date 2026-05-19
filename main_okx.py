@@ -13,10 +13,10 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "DOGE_V4_15M_RECLAIM_DYNAMIC_01"
+VERSION = "DOGE_V5_BREAKOUT_RETEST_01"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
-STATE_FILE = "state_bybit_v4.json"
+STATE_FILE = "state_bybit_v5.json"
 
 SYMBOLS = ["DOGEUSDT"]
 CATEGORY = "linear"
@@ -25,7 +25,7 @@ TREND_INTERVAL = "60"   # 1h trend
 ENTRY_INTERVAL = "15"   # 15m entry
 
 LEVERAGE = 15
-POSITION_PCT = 0.10     # use 10% of actual wallet dynamically
+POSITION_PCT = 0.10     # dynamic 10% of actual wallet
 RECV_WINDOW = "5000"
 
 ATR_PERIOD = 14
@@ -42,10 +42,16 @@ MIN_NET_PROFIT_USDT = 0.003
 MIN_R_MULTIPLE = 1.2
 MIN_GROSS_TO_FEES_MULTIPLE = 4.0
 
-MIN_ATR_PCT = 0.0025          # 0.25%
-MAX_EXTENSION_ATR = 0.75      # don't chase too far from EMA20
+# Strategy filters
+RANGE_LOOKBACK = 12                 # last 12 fully closed 15m candles define range
+MIN_ATR_PCT = 0.0020               # 0.20% minimum volatility
+MIN_RANGE_ATR_MULT = 1.0           # range width must be >= 1x ATR
+BREAKOUT_BUFFER_ATR = 0.05         # breakout close must clear level by small ATR buffer
+RETEST_TOLERANCE_ATR = 0.20        # retest allowed around broken level
+ENTRY_EXTENSION_ATR = 0.50         # do not chase too far after retest
 SL_ATR_BUFFER_MULT = 0.15
 
+# Re-entry block
 REENTRY_BLOCK_MINUTES = 180
 REENTRY_ZONE_ATR_MULT = 1.0
 
@@ -376,6 +382,7 @@ def scan_symbol(symbol: str) -> dict | None:
         log("SCAN", f"{symbol} -> insufficient candles")
         return None
 
+    # exclude current forming candles
     candles_15m = candles_entry_raw[:-1]
     candles_1h = candles_trend_raw[:-1]
 
@@ -391,67 +398,74 @@ def scan_symbol(symbol: str) -> dict | None:
     atr_pct = atr_15m / price if price > 0 else 0
 
     ema200_1h = ema_series(closes_1h, 200)
-    ema20_15m = ema_series(closes_15m, 20)
-    ema50_15m = ema_series(closes_15m, 50)
 
-    i = -1
-    p = -2
+    i = -1   # retest confirmation candle
+    p = -2   # breakout candle
 
     trend_up = closes_1h[-1] > ema200_1h[-1] and ema200_1h[-1] > ema200_1h[-6]
     trend_down = closes_1h[-1] < ema200_1h[-1] and ema200_1h[-1] < ema200_1h[-6]
 
-    bull_micro = ema20_15m[i] > ema50_15m[i]
-    bear_micro = ema20_15m[i] < ema50_15m[i]
-
-    pullback_long = lows_15m[p] <= ema20_15m[p] and closes_15m[p] >= ema50_15m[p]
-    pullback_short = highs_15m[p] >= ema20_15m[p] and closes_15m[p] <= ema50_15m[p]
-
-    bullish_reclaim = (
-        closes_15m[i] > opens_15m[i]
-        and closes_15m[i] > ema20_15m[i]
-        and closes_15m[i] > highs_15m[p]
-    )
-
-    bearish_reclaim = (
-        closes_15m[i] < opens_15m[i]
-        and closes_15m[i] < ema20_15m[i]
-        and closes_15m[i] < lows_15m[p]
-    )
-
-    extension_ok = abs(closes_15m[i] - ema20_15m[i]) <= atr_15m * MAX_EXTENSION_ATR
-
-    log(
-        "SETUP",
-        f"{symbol} | trend_up={trend_up} trend_down={trend_down} | "
-        f"bull_micro={bull_micro} bear_micro={bear_micro} | "
-        f"pb_long={pullback_long} pb_short={pullback_short} | "
-        f"bull_reclaim={bullish_reclaim} bear_reclaim={bearish_reclaim} | "
-        f"extension_ok={extension_ok} | atr_pct={atr_pct:.5f}"
-    )
+    # range excludes breakout and retest candles
+    range_high = max(highs_15m[-(RANGE_LOOKBACK + 2):-2])
+    range_low = min(lows_15m[-(RANGE_LOOKBACK + 2):-2])
+    range_width = range_high - range_low
 
     if atr_pct < MIN_ATR_PCT:
         log("SKIP", f"{symbol} skipped: atr_pct too low ({atr_pct:.5f})")
         return None
+
+    if range_width < atr_15m * MIN_RANGE_ATR_MULT:
+        log("SKIP", f"{symbol} skipped: range too small ({range_width:.6f})")
+        return None
+
+    breakout_up = closes_15m[p] > (range_high + atr_15m * BREAKOUT_BUFFER_ATR) and highs_15m[p] > range_high
+    breakout_down = closes_15m[p] < (range_low - atr_15m * BREAKOUT_BUFFER_ATR) and lows_15m[p] < range_low
+
+    # retest around broken level
+    long_retest_zone_low = range_high - (atr_15m * RETEST_TOLERANCE_ATR)
+    long_retest_zone_high = range_high + (atr_15m * RETEST_TOLERANCE_ATR)
+
+    short_retest_zone_low = range_low - (atr_15m * RETEST_TOLERANCE_ATR)
+    short_retest_zone_high = range_low + (atr_15m * RETEST_TOLERANCE_ATR)
+
+    retest_long = lows_15m[i] <= long_retest_zone_high and lows_15m[i] >= long_retest_zone_low
+    retest_short = highs_15m[i] >= short_retest_zone_low and highs_15m[i] <= short_retest_zone_high
+
+    bullish_confirm = closes_15m[i] > opens_15m[i] and closes_15m[i] > range_high
+    bearish_confirm = closes_15m[i] < opens_15m[i] and closes_15m[i] < range_low
+
+    extension_ok_long = (closes_15m[i] - range_high) <= atr_15m * ENTRY_EXTENSION_ATR
+    extension_ok_short = (range_low - closes_15m[i]) <= atr_15m * ENTRY_EXTENSION_ATR
+
+    log(
+        "SETUP",
+        f"{symbol} | trend_up={trend_up} trend_down={trend_down} | "
+        f"breakout_up={breakout_up} breakout_down={breakout_down} | "
+        f"retest_long={retest_long} retest_short={retest_short} | "
+        f"bullish_confirm={bullish_confirm} bearish_confirm={bearish_confirm} | "
+        f"ext_long={extension_ok_long} ext_short={extension_ok_short} | "
+        f"range_w={range_width:.6f} atr={atr_15m:.6f}"
+    )
 
     side = None
     reason = None
     sl = None
     tp = None
 
-    if trend_up and bull_micro and pullback_long and bullish_reclaim and extension_ok:
+    if trend_up and breakout_up and retest_long and bullish_confirm and extension_ok_long:
         side = "Buy"
-        reason = "1H EMA200 UP + 15M PULLBACK RECLAIM LONG"
-        recent_low = min(lows_15m[-5:])
-        sl = recent_low - (atr_15m * SL_ATR_BUFFER_MULT)
+        reason = "1H EMA200 UP + 15M BREAKOUT RETEST LONG"
+        retest_low = min(lows_15m[i], lows_15m[p])
+        sl = retest_low - (atr_15m * SL_ATR_BUFFER_MULT)
         if sl >= price:
             return None
         tp = price + (abs(price - sl) * RR_RATIO)
 
-    elif trend_down and bear_micro and pullback_short and bearish_reclaim and extension_ok:
+    elif trend_down and breakout_down and retest_short and bearish_confirm and extension_ok_short:
         side = "Sell"
-        reason = "1H EMA200 DOWN + 15M PULLBACK RECLAIM SHORT"
-        recent_high = max(highs_15m[-5:])
-        sl = recent_high + (atr_15m * SL_ATR_BUFFER_MULT)
+        reason = "1H EMA200 DOWN + 15M BREAKOUT RETEST SHORT"
+        retest_high = max(highs_15m[i], highs_15m[p])
+        sl = retest_high + (atr_15m * SL_ATR_BUFFER_MULT)
         if sl <= price:
             return None
         tp = price - (abs(price - sl) * RR_RATIO)
@@ -467,6 +481,7 @@ def scan_symbol(symbol: str) -> dict | None:
         "sl": sl,
         "tp": tp,
         "atr": atr_15m,
+        "range_level": range_high if side == "Buy" else range_low,
     }
 
 
@@ -857,13 +872,13 @@ def main() -> None:
     log("VERSION", VERSION)
     log("CONFIG", f"ATR_PERIOD={ATR_PERIOD} | POSITION_PCT={POSITION_PCT} | DYNAMIC_WALLET_SIZING=ON")
     log("BOT", "=" * 88)
-    log("BOT", "DOGE V4 | 1H EMA200 TREND + 15M PULLBACK RECLAIM | BOTH SIDES")
+    log("BOT", "DOGE V5 | 1H EMA200 + 15M BREAKOUT RETEST | BOTH SIDES")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m")
     log("BOT", f"Dynamic Wallet Sizing: {int(POSITION_PCT * 100)}% of actual wallet | Leverage: {LEVERAGE}x")
     log("BOT", f"RR: 1:{RR_RATIO} | Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
     log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
-    log("BOT", f"Min ATR%: {MIN_ATR_PCT} | Max Extension ATR: {MAX_EXTENSION_ATR}")
+    log("BOT", f"Range Lookback: {RANGE_LOOKBACK} | Min ATR%: {MIN_ATR_PCT}")
     log("BOT", f"Gross/Fees Min: {MIN_GROSS_TO_FEES_MULTIPLE} | Reentry Block: {REENTRY_BLOCK_MINUTES} min")
     log("BOT", "=" * 88)
 
@@ -872,7 +887,7 @@ def main() -> None:
         time.sleep(0.3)
 
     send_telegram(
-        f"🤖 DOGE V4 BOT STARTED\n"
+        f"🤖 DOGE V5 BOT STARTED\n"
         f"Version: {VERSION}\n"
         f"Pair: {', '.join(SYMBOLS)}\n"
         f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
