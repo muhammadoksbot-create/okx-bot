@@ -13,7 +13,7 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "DOGE_V5_BREAKOUT_RETEST_01"
+VERSION = "DOGE_V5_BREAKOUT_RETEST_02"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_bybit_v5.json"
@@ -31,7 +31,7 @@ RECV_WINDOW = "5000"
 ATR_PERIOD = 14
 RR_RATIO = 1.8
 
-CHECK_INTERVAL_SECONDS = 15
+CHECK_INTERVAL_SECONDS = 60
 COOLDOWN_MINUTES = 20
 
 PARTIAL_AT_R = 1.0
@@ -43,7 +43,7 @@ MIN_R_MULTIPLE = 1.2
 MIN_GROSS_TO_FEES_MULTIPLE = 4.0
 
 # Strategy filters
-RANGE_LOOKBACK = 12                 # last 12 fully closed 15m candles define range
+RANGE_LOOKBACK = 8                  # updated from 12 -> 8
 MIN_ATR_PCT = 0.0020               # 0.20% minimum volatility
 MIN_RANGE_ATR_MULT = 1.0           # range width must be >= 1x ATR
 BREAKOUT_BUFFER_ATR = 0.05         # breakout close must clear level by small ATR buffer
@@ -382,7 +382,6 @@ def scan_symbol(symbol: str) -> dict | None:
         log("SCAN", f"{symbol} -> insufficient candles")
         return None
 
-    # exclude current forming candles
     candles_15m = candles_entry_raw[:-1]
     candles_1h = candles_trend_raw[:-1]
 
@@ -399,13 +398,12 @@ def scan_symbol(symbol: str) -> dict | None:
 
     ema200_1h = ema_series(closes_1h, 200)
 
-    i = -1   # retest confirmation candle
-    p = -2   # breakout candle
+    i = -1
+    p = -2
 
     trend_up = closes_1h[-1] > ema200_1h[-1] and ema200_1h[-1] > ema200_1h[-6]
     trend_down = closes_1h[-1] < ema200_1h[-1] and ema200_1h[-1] < ema200_1h[-6]
 
-    # range excludes breakout and retest candles
     range_high = max(highs_15m[-(RANGE_LOOKBACK + 2):-2])
     range_low = min(lows_15m[-(RANGE_LOOKBACK + 2):-2])
     range_width = range_high - range_low
@@ -421,7 +419,6 @@ def scan_symbol(symbol: str) -> dict | None:
     breakout_up = closes_15m[p] > (range_high + atr_15m * BREAKOUT_BUFFER_ATR) and highs_15m[p] > range_high
     breakout_down = closes_15m[p] < (range_low - atr_15m * BREAKOUT_BUFFER_ATR) and lows_15m[p] < range_low
 
-    # retest around broken level
     long_retest_zone_low = range_high - (atr_15m * RETEST_TOLERANCE_ATR)
     long_retest_zone_high = range_high + (atr_15m * RETEST_TOLERANCE_ATR)
 
