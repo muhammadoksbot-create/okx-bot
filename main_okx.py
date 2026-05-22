@@ -13,7 +13,7 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "DOGE_V5_BREAKOUT_RETEST_02"
+VERSION = "DOGE_V5_BREAKOUT_RETEST_03"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_bybit_v5.json"
@@ -25,7 +25,7 @@ TREND_INTERVAL = "60"   # 1h trend
 ENTRY_INTERVAL = "15"   # 15m entry
 
 LEVERAGE = 15
-POSITION_PCT = 0.10     # dynamic 10% of actual wallet
+POSITION_PCT = 0.10
 RECV_WINDOW = "5000"
 
 ATR_PERIOD = 14
@@ -33,6 +33,8 @@ RR_RATIO = 1.8
 
 CHECK_INTERVAL_SECONDS = 60
 COOLDOWN_MINUTES = 20
+
+HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
 
 PARTIAL_AT_R = 1.0
 PARTIAL_CLOSE_PCT = 0.50
@@ -43,20 +45,20 @@ MIN_R_MULTIPLE = 1.2
 MIN_GROSS_TO_FEES_MULTIPLE = 4.0
 
 # Strategy filters
-RANGE_LOOKBACK = 8                  # updated from 12 -> 8
-MIN_ATR_PCT = 0.0020               # 0.20% minimum volatility
-MIN_RANGE_ATR_MULT = 1.0           # range width must be >= 1x ATR
-BREAKOUT_BUFFER_ATR = 0.05         # breakout close must clear level by small ATR buffer
-RETEST_TOLERANCE_ATR = 0.20        # retest allowed around broken level
-ENTRY_EXTENSION_ATR = 0.50         # do not chase too far after retest
+RANGE_LOOKBACK = 8
+MIN_ATR_PCT = 0.0020
+MIN_RANGE_ATR_MULT = 1.0
+BREAKOUT_BUFFER_ATR = 0.00
+RETEST_TOLERANCE_ATR = 0.30
+ENTRY_EXTENSION_ATR = 0.50
 SL_ATR_BUFFER_MULT = 0.15
 
 # Re-entry block
 REENTRY_BLOCK_MINUTES = 180
 REENTRY_ZONE_ATR_MULT = 1.0
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8756536068:AAFu7zrR5W-gu0Mv9bX4Tf9O7kokeqk6G5U")
-CHAT_ID = os.getenv("CHAT_ID", "1118069943")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 
 
 # ============================================================
@@ -68,7 +70,7 @@ def log(tag: str, msg: str) -> None:
 
 
 def send_telegram(msg: str) -> None:
-    if not TELEGRAM_TOKEN or not CHAT_ID or "YOUR_" in TELEGRAM_TOKEN or "YOUR_" in CHAT_ID:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -161,6 +163,7 @@ def default_state() -> dict:
         "last_closed_side": None,
         "last_closed_price": None,
         "last_close_reason": None,
+        "last_heartbeat_at": None,
         "initial_risk": None,
         "partial_taken": False,
         "partial_qty": None,
@@ -185,6 +188,47 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+def maybe_send_heartbeat(
+    state: dict,
+    balance: float | None = None,
+    actual_pos: dict | None = None,
+    status: str = "Running"
+) -> None:
+    now_ts = time.time()
+    last_heartbeat = state.get("last_heartbeat_at")
+
+    if last_heartbeat is not None:
+        try:
+            if now_ts - float(last_heartbeat) < HEARTBEAT_INTERVAL_SECONDS:
+                return
+        except Exception:
+            pass
+
+    balance_text = "N/A" if balance is None else f"{balance:.4f} USDT"
+
+    if actual_pos:
+        position_text = (
+            f"{actual_pos.get('symbol')} {actual_pos.get('side')} | "
+            f"Size: {actual_pos.get('size')} | "
+            f"Entry: {actual_pos.get('entry')}"
+        )
+    else:
+        position_text = "No open position"
+
+    send_telegram(
+        f"✅ BOT HEARTBEAT\n"
+        f"Version: {VERSION}\n"
+        f"Status: {status}\n"
+        f"Pair: {', '.join(SYMBOLS)}\n"
+        f"Balance: {balance_text}\n"
+        f"Position: {position_text}\n"
+        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+
+    state["last_heartbeat_at"] = now_ts
+    save_state(state)
 
 
 # ============================================================
@@ -693,6 +737,7 @@ def run() -> str:
 
     actual_pos = find_any_open_position()
     if actual_pos:
+        maybe_send_heartbeat(state, balance=None, actual_pos=actual_pos, status="Managing open position")
         return manage_open_position(state, actual_pos)
 
     if state.get("pos"):
@@ -726,6 +771,7 @@ def run() -> str:
         log("CLOSE", f"{close_reason} | {symbol} | gross={gross_text} fees={fees_text} net={net_text}")
 
         new_state = default_state()
+        new_state["last_heartbeat_at"] = state.get("last_heartbeat_at")
         new_state["last_closed_at"] = now_ts
         new_state["last_closed_symbol"] = state.get("symbol")
         new_state["last_closed_side"] = state.get("pos")
@@ -744,6 +790,8 @@ def run() -> str:
     actual_balance = get_balance()
     if actual_balance is None or actual_balance <= 0:
         return "No balance"
+
+    maybe_send_heartbeat(state, balance=actual_balance, actual_pos=None, status="Running / scanning setups")
 
     sizing_balance = actual_balance
 
@@ -876,14 +924,16 @@ def main() -> None:
     log("BOT", f"RR: 1:{RR_RATIO} | Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
     log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
     log("BOT", f"Range Lookback: {RANGE_LOOKBACK} | Min ATR%: {MIN_ATR_PCT}")
+    log("BOT", f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR} | Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}")
     log("BOT", f"Gross/Fees Min: {MIN_GROSS_TO_FEES_MULTIPLE} | Reentry Block: {REENTRY_BLOCK_MINUTES} min")
+    log("BOT", f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours")
     log("BOT", "=" * 88)
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
         time.sleep(0.3)
 
-    send_telegram(
+    startup_msg = (
         f"🤖 DOGE V5 BOT STARTED\n"
         f"Version: {VERSION}\n"
         f"Pair: {', '.join(SYMBOLS)}\n"
@@ -894,8 +944,17 @@ def main() -> None:
         f"Check Interval: {CHECK_INTERVAL_SECONDS}s\n"
         f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
         f"ATR_PERIOD: {ATR_PERIOD}\n"
+        f"Range Lookback: {RANGE_LOOKBACK}\n"
+        f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR}\n"
+        f"Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}\n"
+        f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
         f"Mode: 1 active trade only"
     )
+    send_telegram(startup_msg)
+
+    state = load_state()
+    state["last_heartbeat_at"] = time.time()
+    save_state(state)
 
     while True:
         try:
