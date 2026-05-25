@@ -13,7 +13,7 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "DOGE_V5_BREAKOUT_RETEST_03"
+VERSION = "DOGE_V5_BREAKOUT_RETEST_04"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_bybit_v5.json"
@@ -33,7 +33,6 @@ RR_RATIO = 1.8
 
 CHECK_INTERVAL_SECONDS = 60
 COOLDOWN_MINUTES = 20
-
 HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
 
 PARTIAL_AT_R = 1.0
@@ -49,8 +48,9 @@ RANGE_LOOKBACK = 8
 MIN_ATR_PCT = 0.0020
 MIN_RANGE_ATR_MULT = 1.0
 BREAKOUT_BUFFER_ATR = 0.00
-RETEST_TOLERANCE_ATR = 0.30
-ENTRY_EXTENSION_ATR = 0.50
+RETEST_TOLERANCE_ATR = 0.45
+ENTRY_EXTENSION_ATR = 0.70
+CONFIRM_TOLERANCE_ATR = 0.10
 SL_ATR_BUFFER_MULT = 0.15
 
 # Re-entry block
@@ -71,10 +71,17 @@ def log(tag: str, msg: str) -> None:
 
 def send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        log("TG_SKIP", "TELEGRAM_TOKEN or CHAT_ID missing")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+
+        if r.status_code != 200:
+            log("TG_ERR", f"status={r.status_code} response={r.text}")
+        else:
+            log("TG_OK", "Telegram message sent")
+
     except Exception as e:
         log("TG_ERR", str(e))
 
@@ -469,11 +476,18 @@ def scan_symbol(symbol: str) -> dict | None:
     short_retest_zone_low = range_low - (atr_15m * RETEST_TOLERANCE_ATR)
     short_retest_zone_high = range_low + (atr_15m * RETEST_TOLERANCE_ATR)
 
-    retest_long = lows_15m[i] <= long_retest_zone_high and lows_15m[i] >= long_retest_zone_low
-    retest_short = highs_15m[i] >= short_retest_zone_low and highs_15m[i] <= short_retest_zone_high
+    retest_long = lows_15m[i] <= long_retest_zone_high and closes_15m[i] >= long_retest_zone_low
+    retest_short = highs_15m[i] >= short_retest_zone_low and closes_15m[i] <= short_retest_zone_high
 
-    bullish_confirm = closes_15m[i] > opens_15m[i] and closes_15m[i] > range_high
-    bearish_confirm = closes_15m[i] < opens_15m[i] and closes_15m[i] < range_low
+    bullish_confirm = (
+        closes_15m[i] > opens_15m[i]
+        and closes_15m[i] >= range_high - (atr_15m * CONFIRM_TOLERANCE_ATR)
+    )
+
+    bearish_confirm = (
+        closes_15m[i] < opens_15m[i]
+        and closes_15m[i] <= range_low + (atr_15m * CONFIRM_TOLERANCE_ATR)
+    )
 
     extension_ok_long = (closes_15m[i] - range_high) <= atr_15m * ENTRY_EXTENSION_ATR
     extension_ok_short = (range_low - closes_15m[i]) <= atr_15m * ENTRY_EXTENSION_ATR
@@ -925,6 +939,7 @@ def main() -> None:
     log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
     log("BOT", f"Range Lookback: {RANGE_LOOKBACK} | Min ATR%: {MIN_ATR_PCT}")
     log("BOT", f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR} | Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}")
+    log("BOT", f"Confirm Tolerance ATR: {CONFIRM_TOLERANCE_ATR} | Entry Extension ATR: {ENTRY_EXTENSION_ATR}")
     log("BOT", f"Gross/Fees Min: {MIN_GROSS_TO_FEES_MULTIPLE} | Reentry Block: {REENTRY_BLOCK_MINUTES} min")
     log("BOT", f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours")
     log("BOT", "=" * 88)
@@ -947,6 +962,8 @@ def main() -> None:
         f"Range Lookback: {RANGE_LOOKBACK}\n"
         f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR}\n"
         f"Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}\n"
+        f"Confirm Tolerance ATR: {CONFIRM_TOLERANCE_ATR}\n"
+        f"Entry Extension ATR: {ENTRY_EXTENSION_ATR}\n"
         f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
         f"Mode: 1 active trade only"
     )
