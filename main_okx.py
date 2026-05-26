@@ -13,16 +13,16 @@ from config_okx import API_KEY, SECRET_KEY
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "DOGE_V5_BREAKOUT_RETEST_04"
+VERSION = "V5_05_MULTI_PAIR_BREAKOUT_RETEST"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_bybit_v5.json"
 
-SYMBOLS = ["DOGEUSDT"]
+SYMBOLS = ["DOGEUSDT", "HBARUSDT", "XLMUSDT"]
 CATEGORY = "linear"
 
-TREND_INTERVAL = "60"   # 1h trend
-ENTRY_INTERVAL = "15"   # 15m entry
+TREND_INTERVAL = "60"
+ENTRY_INTERVAL = "15"
 
 LEVERAGE = 15
 POSITION_PCT = 0.10
@@ -31,7 +31,7 @@ RECV_WINDOW = "5000"
 ATR_PERIOD = 14
 RR_RATIO = 1.8
 
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 180
 COOLDOWN_MINUTES = 20
 HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
 
@@ -228,7 +228,7 @@ def maybe_send_heartbeat(
         f"✅ BOT HEARTBEAT\n"
         f"Version: {VERSION}\n"
         f"Status: {status}\n"
-        f"Pair: {', '.join(SYMBOLS)}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Balance: {balance_text}\n"
         f"Position: {position_text}\n"
         f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
@@ -647,10 +647,7 @@ def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, f
     reason = "Position Closed"
 
     if tp is not None and sl is not None:
-        if side == "Buy":
-            reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
-        else:
-            reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
+        reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
 
     gross, fees, net = net_pnl_estimate(side, entry, last_price, qty)
     return reason, gross, fees, net
@@ -931,7 +928,7 @@ def main() -> None:
     log("VERSION", VERSION)
     log("CONFIG", f"ATR_PERIOD={ATR_PERIOD} | POSITION_PCT={POSITION_PCT} | DYNAMIC_WALLET_SIZING=ON")
     log("BOT", "=" * 88)
-    log("BOT", "DOGE V5 | 1H EMA200 + 15M BREAKOUT RETEST | BOTH SIDES")
+    log("BOT", "V5 MULTI-PAIR | 1H EMA200 + 15M BREAKOUT RETEST | BOTH SIDES")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
     log("BOT", f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m")
     log("BOT", f"Dynamic Wallet Sizing: {int(POSITION_PCT * 100)}% of actual wallet | Leverage: {LEVERAGE}x")
@@ -946,12 +943,12 @@ def main() -> None:
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
-        time.sleep(0.3)
+        time.sleep(0.8)
 
     startup_msg = (
-        f"🤖 DOGE V5 BOT STARTED\n"
+        f"🤖 V5 MULTI-PAIR BOT STARTED\n"
         f"Version: {VERSION}\n"
-        f"Pair: {', '.join(SYMBOLS)}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
         f"Dynamic Wallet Sizing: {int(POSITION_PCT*100)}% of actual wallet\n"
         f"Leverage: {LEVERAGE}x\n"
