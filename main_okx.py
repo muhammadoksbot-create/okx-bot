@@ -1,68 +1,57 @@
-import requests
-import hmac
 import hashlib
+import hmac
 import json
+import math
 import os
 import time
-import math
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
-from config_okx import API_KEY, SECRET_KEY
+import requests
+
 
 # ============================================================
 # CONFIG
 # ============================================================
-VERSION = "V5_05_MULTI_PAIR_BREAKOUT_RETEST"
+VERSION = "HIGHER_TF_SWING_V1"
 
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
-STATE_FILE = "state_bybit_v5.json"
 
-SYMBOLS = ["DOGEUSDT", "HBARUSDT", "XLMUSDT"]
-CATEGORY = "linear"
+# Bybit API keys are kept in config_okx.py, same as the old setup.
+# Do NOT hardcode API keys here.
+from config_okx import API_KEY, SECRET_KEY
 
-TREND_INTERVAL = "60"
-ENTRY_INTERVAL = "15"
-
-LEVERAGE = 15
-POSITION_PCT = 0.10
 RECV_WINDOW = "5000"
-
-ATR_PERIOD = 14
-RR_RATIO = 1.8
-
-CHECK_INTERVAL_SECONDS = 180
-COOLDOWN_MINUTES = 20
-HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
-
-PARTIAL_AT_R = 1.0
-PARTIAL_CLOSE_PCT = 0.50
-
-TAKER_FEE_RATE = 0.00055
-MIN_NET_PROFIT_USDT = 0.003
-MIN_R_MULTIPLE = 1.2
-MIN_GROSS_TO_FEES_MULTIPLE = 4.0
-
-# Strategy filters
-RANGE_LOOKBACK = 8
-MIN_ATR_PCT = 0.0020
-MIN_RANGE_ATR_MULT = 1.0
-BREAKOUT_BUFFER_ATR = 0.00
-RETEST_TOLERANCE_ATR = 0.45
-ENTRY_EXTENSION_ATR = 0.70
-CONFIRM_TOLERANCE_ATR = 0.10
-SL_ATR_BUFFER_MULT = 0.15
-
-# Re-entry block
-REENTRY_BLOCK_MINUTES = 180
-REENTRY_ZONE_ATR_MULT = 1.0
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
+STATE_FILE = "state_higher_tf_swing.json"
+CATEGORY = "linear"
+SYMBOLS = ["DOGEUSDT", "XLMUSDT", "HBARUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+TREND_INTERVAL = "240"
+ENTRY_INTERVAL = "60"
+
+LEVERAGE = 5
+POSITION_PCT = 0.10
+RR_RATIO = 3.0
+ATR_PERIOD = 14
+COOLDOWN_SECONDS = 3 * 60 * 60
+CHECK_INTERVAL_SECONDS = 15 * 60
+HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
+
+EMA_SLOPE_LOOKBACK = 5
+PULLBACK_TOLERANCE_ATR = 0.35
+SL_ATR_MULT = 1.0
+
+TAKER_FEE_RATE = 0.00055
+DAILY_LOSS_STOP_PCT = 0.05
+MAX_CONSECUTIVE_LOSSES = 8
+
 
 # ============================================================
-# LOGGING
+# LOGGING / TELEGRAM
 # ============================================================
 def log(tag: str, msg: str) -> None:
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -76,26 +65,26 @@ def send_telegram(msg: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-
         if r.status_code != 200:
             log("TG_ERR", f"status={r.status_code} response={r.text}")
-        else:
-            log("TG_OK", "Telegram message sent")
-
     except Exception as e:
         log("TG_ERR", str(e))
 
 
 # ============================================================
-# AUTH
+# AUTH / HTTP
 # ============================================================
+def require_api_keys() -> bool:
+    if API_KEY and SECRET_KEY:
+        return True
+    log("KEYS", "API_KEY or SECRET_KEY missing in config_okx.py")
+    send_telegram("⚠️ BOT NOT TRADING\nAPI_KEY or SECRET_KEY missing in config_okx.py")
+    return False
+
+
 def _sign(payload: str, timestamp: str) -> str:
     plain = f"{timestamp}{API_KEY}{RECV_WINDOW}{payload}"
-    return hmac.new(
-        SECRET_KEY.encode("utf-8"),
-        plain.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    return hmac.new(SECRET_KEY.encode("utf-8"), plain.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _headers(payload: str, timestamp: str) -> dict:
@@ -108,46 +97,32 @@ def _headers(payload: str, timestamp: str) -> dict:
     }
 
 
-# ============================================================
-# HTTP WITH RETRY
-# ============================================================
 def req(method: str, path: str, params: dict | None = None, body: dict | None = None, retries: int = 3) -> dict:
     last_err = None
-
     for attempt in range(1, retries + 1):
         try:
             timestamp = str(int(time.time() * 1000))
-
             if method.upper() == "GET":
-                query_string = urlencode(params or {})
-                headers = _headers(query_string, timestamp)
+                payload = urlencode(params or {})
                 url = f"{BASE_URL}{path}"
-                if query_string:
-                    url += f"?{query_string}"
-                r = requests.get(url, headers=headers, timeout=15)
-
+                if payload:
+                    url += f"?{payload}"
+                r = requests.get(url, headers=_headers(payload, timestamp), timeout=15)
             elif method.upper() == "POST":
-                body_str = json.dumps(body or {}, separators=(",", ":"))
-                headers = _headers(body_str, timestamp)
-                url = f"{BASE_URL}{path}"
-                r = requests.post(url, headers=headers, data=body_str, timeout=15)
-
+                payload = json.dumps(body or {}, separators=(",", ":"))
+                r = requests.post(f"{BASE_URL}{path}", headers=_headers(payload, timestamp), data=payload, timeout=15)
             else:
                 raise ValueError(f"Unsupported method: {method}")
 
             data = r.json()
-
             if data.get("retCode") not in (0, None):
                 log("API_RET", f"{path} -> retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
-
             return data
-
         except Exception as e:
             last_err = e
-            log("API_ERR", f"{path} attempt {attempt}/{retries} -> {e}")
+            log("API_ERR", f"{path} attempt {attempt}/{retries}: {e}")
             if attempt < retries:
                 time.sleep(1.5 * attempt)
-
     send_telegram(f"⚠️ API ERROR\n{path}\n{last_err}")
     return {}
 
@@ -158,24 +133,20 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 def default_state() -> dict:
     return {
         "symbol": None,
-        "pos": None,
+        "side": None,
         "entry": None,
         "sl": None,
         "tp": None,
-        "size": None,
-        "reason": None,
-        "opened": None,
+        "qty": None,
+        "opened_at": None,
         "last_closed_at": None,
-        "last_closed_symbol": None,
-        "last_closed_side": None,
-        "last_closed_price": None,
-        "last_close_reason": None,
         "last_heartbeat_at": None,
-        "initial_risk": None,
-        "partial_taken": False,
-        "partial_qty": None,
-        "remaining_qty": None,
-        "breakeven_moved": False,
+        "consecutive_losses": 0,
+        "paused_after_losses": False,
+        "daily_date": None,
+        "daily_start_wallet": None,
+        "daily_realized_pnl": 0.0,
+        "daily_loss_stopped": False,
     }
 
 
@@ -188,7 +159,8 @@ def load_state() -> dict:
         state = default_state()
         state.update(data)
         return state
-    except Exception:
+    except Exception as e:
+        log("STATE_ERR", f"load failed: {e}")
         return default_state()
 
 
@@ -197,60 +169,30 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def maybe_send_heartbeat(
-    state: dict,
-    balance: float | None = None,
-    actual_pos: dict | None = None,
-    status: str = "Running"
-) -> None:
-    now_ts = time.time()
-    last_heartbeat = state.get("last_heartbeat_at")
+def utc_day() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
-    if last_heartbeat is not None:
-        try:
-            if now_ts - float(last_heartbeat) < HEARTBEAT_INTERVAL_SECONDS:
-                return
-        except Exception:
-            pass
 
-    balance_text = "N/A" if balance is None else f"{balance:.4f} USDT"
-
-    if actual_pos:
-        position_text = (
-            f"{actual_pos.get('symbol')} {actual_pos.get('side')} | "
-            f"Size: {actual_pos.get('size')} | "
-            f"Entry: {actual_pos.get('entry')}"
-        )
-    else:
-        position_text = "No open position"
-
-    send_telegram(
-        f"✅ BOT HEARTBEAT\n"
-        f"Version: {VERSION}\n"
-        f"Status: {status}\n"
-        f"Pairs: {', '.join(SYMBOLS)}\n"
-        f"Balance: {balance_text}\n"
-        f"Position: {position_text}\n"
-        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
-
-    state["last_heartbeat_at"] = now_ts
+def reset_daily_if_needed(state: dict, wallet: float | None) -> None:
+    today = utc_day()
+    if state.get("daily_date") == today:
+        return
+    state["daily_date"] = today
+    state["daily_start_wallet"] = wallet
+    state["daily_realized_pnl"] = 0.0
+    state["daily_loss_stopped"] = False
     save_state(state)
+    log("DAILY", f"new day reset | start_wallet={wallet}")
 
 
 # ============================================================
-# MARKET DATA
+# MARKET / ACCOUNT
 # ============================================================
 def get_candles(symbol: str, interval: str, limit: int = 300) -> list:
     r = req(
         "GET",
         "/v5/market/kline",
-        params={
-            "category": CATEGORY,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        },
+        params={"category": CATEGORY, "symbol": symbol, "interval": interval, "limit": limit},
     )
     if r.get("retCode") == 0 and r.get("result", {}).get("list"):
         return list(reversed(r["result"]["list"]))
@@ -258,11 +200,7 @@ def get_candles(symbol: str, interval: str, limit: int = 300) -> list:
 
 
 def get_price(symbol: str) -> float | None:
-    r = req(
-        "GET",
-        "/v5/market/tickers",
-        params={"category": CATEGORY, "symbol": symbol},
-    )
+    r = req("GET", "/v5/market/tickers", params={"category": CATEGORY, "symbol": symbol})
     try:
         return float(r["result"]["list"][0]["lastPrice"])
     except Exception:
@@ -270,19 +208,13 @@ def get_price(symbol: str) -> float | None:
 
 
 def get_balance() -> float | None:
-    r = req(
-        "GET",
-        "/v5/account/wallet-balance",
-        params={"accountType": "UNIFIED", "coin": "USDT"},
-    )
+    r = req("GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED", "coin": "USDT"})
     try:
         coin_list = r["result"]["list"][0]["coin"]
-        if not coin_list:
-            return None
         usdt = coin_list[0]
         wallet_balance = float(usdt.get("walletBalance", 0))
         equity = float(usdt.get("equity", wallet_balance))
-        log("BALANCE", f"walletBalance={wallet_balance} equity={equity}")
+        log("BALANCE", f"walletBalance={wallet_balance:.6f} equity={equity:.6f}")
         return wallet_balance
     except Exception as e:
         log("BALANCE_ERR", f"{e} | RAW={r}")
@@ -290,11 +222,7 @@ def get_balance() -> float | None:
 
 
 def get_instrument_info(symbol: str) -> dict | None:
-    r = req(
-        "GET",
-        "/v5/market/instruments-info",
-        params={"category": CATEGORY, "symbol": symbol},
-    )
+    r = req("GET", "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": symbol})
     try:
         info = r["result"]["list"][0]
         return {
@@ -302,16 +230,13 @@ def get_instrument_info(symbol: str) -> dict | None:
             "min_order_qty": float(info["lotSizeFilter"]["minOrderQty"]),
             "tick_size": float(info["priceFilter"]["tickSize"]),
         }
-    except Exception:
+    except Exception as e:
+        log("INSTRUMENT_ERR", f"{symbol}: {e}")
         return None
 
 
 def get_open_position(symbol: str) -> dict | None:
-    r = req(
-        "GET",
-        "/v5/position/list",
-        params={"category": CATEGORY, "symbol": symbol},
-    )
+    r = req("GET", "/v5/position/list", params={"category": CATEGORY, "symbol": symbol})
     try:
         for pos in r["result"]["list"]:
             size = float(pos.get("size", 0))
@@ -325,7 +250,7 @@ def get_open_position(symbol: str) -> dict | None:
                     "markPrice": float(pos.get("markPrice", 0) or 0),
                 }
     except Exception as e:
-        log("POS_ERR", f"{symbol} -> {e}")
+        log("POS_ERR", f"{symbol}: {e}")
     return None
 
 
@@ -346,13 +271,13 @@ def set_leverage(symbol: str) -> None:
     }
     r = req("POST", "/v5/position/set-leverage", body=body)
     if r.get("retCode") == 0:
-        log("LEVERAGE", f"✅ Set {LEVERAGE}x on {symbol}")
+        log("LEVERAGE", f"{symbol} set to {LEVERAGE}x")
     else:
-        log("LEVERAGE", f"{symbol} -> {r.get('retMsg', r)}")
+        log("LEVERAGE", f"{symbol}: {r.get('retMsg', r)}")
 
 
 # ============================================================
-# HELPERS
+# INDICATORS / HELPERS
 # ============================================================
 def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
@@ -366,24 +291,26 @@ def round_price(price: float, tick_size: float) -> float:
     return round(round(price / tick_size) * tick_size, 8)
 
 
-def iso_now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
 def ema_series(values: list[float], period: int) -> list[float]:
     if not values:
         return []
     k = 2 / (period + 1)
     out = [values[0]]
-    for v in values[1:]:
-        out.append(v * k + out[-1] * (1 - k))
+    for value in values[1:]:
+        out.append(value * k + out[-1] * (1 - k))
     return out
 
 
-def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
-    entry_notional = entry * qty
-    exit_notional = exit_price * qty
-    return (entry_notional * TAKER_FEE_RATE) + (exit_notional * TAKER_FEE_RATE)
+def atr(candles: list, period: int = ATR_PERIOD) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        high = float(candles[i][2])
+        low = float(candles[i][3])
+        prev_close = float(candles[i - 1][4])
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs[-period:]) / period if trs else 0.0
 
 
 def gross_pnl(side: str, entry: float, exit_price: float, qty: float) -> float:
@@ -392,174 +319,116 @@ def gross_pnl(side: str, entry: float, exit_price: float, qty: float) -> float:
     return (entry - exit_price) * qty
 
 
+def estimate_round_trip_fees(entry: float, exit_price: float, qty: float) -> float:
+    return entry * qty * TAKER_FEE_RATE + exit_price * qty * TAKER_FEE_RATE
+
+
 def net_pnl_estimate(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float, float]:
     gross = gross_pnl(side, entry, exit_price, qty)
     fees = estimate_round_trip_fees(entry, exit_price, qty)
-    net = gross - fees
-    return gross, fees, net
+    return gross, fees, gross - fees
 
 
-def atr(candles: list, period: int = 14) -> float:
-    if len(candles) < period + 1:
-        return 0.0
-
-    trs = []
-    for i in range(1, len(candles)):
-        high = float(candles[i][2])
-        low = float(candles[i][3])
-        prev_close = float(candles[i - 1][4])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-
-    return sum(trs[-period:]) / period if trs else 0.0
-
-
-def fee_adjusted_be_price(entry: float, side: str, tick_size: float) -> float:
-    offset = entry * (TAKER_FEE_RATE * 2.2)
-    offset += tick_size * 2
-    if side == "Buy":
-        return round_price(entry + offset, tick_size)
-    return round_price(entry - offset, tick_size)
+def build_order_qty(symbol: str, wallet: float, price: float) -> float | None:
+    instrument = get_instrument_info(symbol)
+    if not instrument:
+        return None
+    exposure = wallet * POSITION_PCT * LEVERAGE
+    qty = floor_to_step(exposure / price, instrument["qty_step"])
+    if qty < instrument["min_order_qty"]:
+        qty = instrument["min_order_qty"]
+    return round(qty, 8)
 
 
 # ============================================================
 # SIGNAL LOGIC
 # ============================================================
 def scan_symbol(symbol: str) -> dict | None:
-    candles_entry_raw = get_candles(symbol, ENTRY_INTERVAL, 300)
-    candles_trend_raw = get_candles(symbol, TREND_INTERVAL, 300)
+    candles_1h_raw = get_candles(symbol, ENTRY_INTERVAL, 300)
+    candles_4h_raw = get_candles(symbol, TREND_INTERVAL, 300)
 
-    if len(candles_entry_raw) < 120 or len(candles_trend_raw) < 220:
-        log("SCAN", f"{symbol} -> insufficient candles")
+    if len(candles_1h_raw) < 80 or len(candles_4h_raw) < 220:
+        log("SKIP", f"{symbol}: insufficient candles 1h={len(candles_1h_raw)} 4h={len(candles_4h_raw)}")
         return None
 
-    candles_15m = candles_entry_raw[:-1]
-    candles_1h = candles_trend_raw[:-1]
+    candles_1h = candles_1h_raw[:-1]
+    candles_4h = candles_4h_raw[:-1]
 
-    closes_15m = [float(c[4]) for c in candles_15m]
-    highs_15m = [float(c[2]) for c in candles_15m]
-    lows_15m = [float(c[3]) for c in candles_15m]
-    opens_15m = [float(c[1]) for c in candles_15m]
+    opens = [float(c[1]) for c in candles_1h]
+    highs = [float(c[2]) for c in candles_1h]
+    lows = [float(c[3]) for c in candles_1h]
+    closes = [float(c[4]) for c in candles_1h]
+    closes_4h = [float(c[4]) for c in candles_4h]
 
-    closes_1h = [float(c[4]) for c in candles_1h]
+    ema20 = ema_series(closes, 20)
+    ema50 = ema_series(closes, 50)
+    ema200_4h = ema_series(closes_4h, 200)
+    atr_1h = atr(candles_1h, ATR_PERIOD)
 
-    price = closes_15m[-1]
-    atr_15m = atr(candles_15m, ATR_PERIOD)
-    atr_pct = atr_15m / price if price > 0 else 0
-
-    ema200_1h = ema_series(closes_1h, 200)
+    if atr_1h <= 0:
+        log("SKIP", f"{symbol}: ATR unavailable")
+        return None
 
     i = -1
     p = -2
+    price = closes[i]
 
-    trend_up = closes_1h[-1] > ema200_1h[-1] and ema200_1h[-1] > ema200_1h[-6]
-    trend_down = closes_1h[-1] < ema200_1h[-1] and ema200_1h[-1] < ema200_1h[-6]
+    trend_up = closes_4h[-1] > ema200_4h[-1] and ema200_4h[-1] > ema200_4h[-1 - EMA_SLOPE_LOOKBACK]
+    trend_down = closes_4h[-1] < ema200_4h[-1] and ema200_4h[-1] < ema200_4h[-1 - EMA_SLOPE_LOOKBACK]
 
-    range_high = max(highs_15m[-(RANGE_LOOKBACK + 2):-2])
-    range_low = min(lows_15m[-(RANGE_LOOKBACK + 2):-2])
-    range_width = range_high - range_low
+    tol = atr_1h * PULLBACK_TOLERANCE_ATR
+    long_pullback = lows[i] <= max(ema20[i], ema50[i]) + tol and closes[p] <= ema20[p] + tol
+    short_pullback = highs[i] >= min(ema20[i], ema50[i]) - tol and closes[p] >= ema20[p] - tol
 
-    if atr_pct < MIN_ATR_PCT:
-        log("SKIP", f"{symbol} skipped: atr_pct too low ({atr_pct:.5f})")
-        return None
-
-    if range_width < atr_15m * MIN_RANGE_ATR_MULT:
-        log("SKIP", f"{symbol} skipped: range too small ({range_width:.6f})")
-        return None
-
-    breakout_up = closes_15m[p] > (range_high + atr_15m * BREAKOUT_BUFFER_ATR) and highs_15m[p] > range_high
-    breakout_down = closes_15m[p] < (range_low - atr_15m * BREAKOUT_BUFFER_ATR) and lows_15m[p] < range_low
-
-    long_retest_zone_low = range_high - (atr_15m * RETEST_TOLERANCE_ATR)
-    long_retest_zone_high = range_high + (atr_15m * RETEST_TOLERANCE_ATR)
-
-    short_retest_zone_low = range_low - (atr_15m * RETEST_TOLERANCE_ATR)
-    short_retest_zone_high = range_low + (atr_15m * RETEST_TOLERANCE_ATR)
-
-    retest_long = lows_15m[i] <= long_retest_zone_high and closes_15m[i] >= long_retest_zone_low
-    retest_short = highs_15m[i] >= short_retest_zone_low and closes_15m[i] <= short_retest_zone_high
-
-    bullish_confirm = (
-        closes_15m[i] > opens_15m[i]
-        and closes_15m[i] >= range_high - (atr_15m * CONFIRM_TOLERANCE_ATR)
-    )
-
-    bearish_confirm = (
-        closes_15m[i] < opens_15m[i]
-        and closes_15m[i] <= range_low + (atr_15m * CONFIRM_TOLERANCE_ATR)
-    )
-
-    extension_ok_long = (closes_15m[i] - range_high) <= atr_15m * ENTRY_EXTENSION_ATR
-    extension_ok_short = (range_low - closes_15m[i]) <= atr_15m * ENTRY_EXTENSION_ATR
+    bullish = closes[i] > opens[i] and closes[i] > ema20[i]
+    bearish = closes[i] < opens[i] and closes[i] < ema20[i]
 
     log(
         "SETUP",
-        f"{symbol} | trend_up={trend_up} trend_down={trend_down} | "
-        f"breakout_up={breakout_up} breakout_down={breakout_down} | "
-        f"retest_long={retest_long} retest_short={retest_short} | "
-        f"bullish_confirm={bullish_confirm} bearish_confirm={bearish_confirm} | "
-        f"ext_long={extension_ok_long} ext_short={extension_ok_short} | "
-        f"range_w={range_width:.6f} atr={atr_15m:.6f}"
+        f"{symbol} | trend_up={trend_up} trend_down={trend_down} "
+        f"long_pullback={long_pullback} short_pullback={short_pullback} "
+        f"bullish={bullish} bearish={bearish} price={price:.6f} atr1h={atr_1h:.6f}",
     )
 
-    side = None
-    reason = None
-    sl = None
-    tp = None
-
-    if trend_up and breakout_up and retest_long and bullish_confirm and extension_ok_long:
-        side = "Buy"
-        reason = "1H EMA200 UP + 15M BREAKOUT RETEST LONG"
-        retest_low = min(lows_15m[i], lows_15m[p])
-        sl = retest_low - (atr_15m * SL_ATR_BUFFER_MULT)
+    if trend_up and long_pullback and bullish:
+        sl = lows[i] - atr_1h * SL_ATR_MULT
         if sl >= price:
+            log("SKIP", f"{symbol}: long SL invalid sl={sl:.6f} price={price:.6f}")
             return None
-        tp = price + (abs(price - sl) * RR_RATIO)
+        tp = price + abs(price - sl) * RR_RATIO
+        return {
+            "symbol": symbol,
+            "side": "Buy",
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "atr": atr_1h,
+            "reason": "4H EMA200 UP + 1H EMA20/50 PULLBACK LONG",
+        }
 
-    elif trend_down and breakout_down and retest_short and bearish_confirm and extension_ok_short:
-        side = "Sell"
-        reason = "1H EMA200 DOWN + 15M BREAKOUT RETEST SHORT"
-        retest_high = max(highs_15m[i], highs_15m[p])
-        sl = retest_high + (atr_15m * SL_ATR_BUFFER_MULT)
+    if trend_down and short_pullback and bearish:
+        sl = highs[i] + atr_1h * SL_ATR_MULT
         if sl <= price:
+            log("SKIP", f"{symbol}: short SL invalid sl={sl:.6f} price={price:.6f}")
             return None
-        tp = price - (abs(price - sl) * RR_RATIO)
+        tp = price - abs(price - sl) * RR_RATIO
+        return {
+            "symbol": symbol,
+            "side": "Sell",
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "atr": atr_1h,
+            "reason": "4H EMA200 DOWN + 1H EMA20/50 PULLBACK SHORT",
+        }
 
-    if not side:
-        return None
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "reason": reason,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "atr": atr_15m,
-        "range_level": range_high if side == "Buy" else range_low,
-    }
+    log("SKIP", f"{symbol}: no valid setup")
+    return None
 
 
 # ============================================================
-# ORDER MANAGEMENT
+# ORDERS / ALERTS
 # ============================================================
-def build_order_qty(symbol: str, sizing_balance_usdt: float, price: float) -> float | None:
-    instrument = get_instrument_info(symbol)
-    if not instrument:
-        log("SIZE", f"{symbol} -> instrument info failed")
-        return None
-
-    position_value = sizing_balance_usdt * POSITION_PCT
-    exposure = position_value * LEVERAGE
-    raw_qty = exposure / price
-
-    qty = floor_to_step(raw_qty, instrument["qty_step"])
-    if qty < instrument["min_order_qty"]:
-        qty = instrument["min_order_qty"]
-
-    return round(qty, 8)
-
-
 def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dict:
     body = {
         "category": CATEGORY,
@@ -577,398 +446,266 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
     return req("POST", "/v5/order/create", body=body)
 
 
-def reduce_position(symbol: str, current_side: str, qty: float) -> dict:
-    close_side = "Sell" if current_side == "Buy" else "Buy"
-    body = {
-        "category": CATEGORY,
-        "symbol": symbol,
-        "side": close_side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "positionIdx": 0,
-        "reduceOnly": True,
-    }
-    return req("POST", "/v5/order/create", body=body)
+def update_state_open(state: dict, setup: dict, qty: float, sl: float, tp: float) -> None:
+    state.update(
+        {
+            "symbol": setup["symbol"],
+            "side": setup["side"],
+            "entry": setup["price"],
+            "sl": sl,
+            "tp": tp,
+            "qty": qty,
+            "opened_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    save_state(state)
 
 
-def update_trading_stop(symbol: str, sl: float | None = None, tp: float | None = None) -> dict:
-    body = {
-        "category": CATEGORY,
-        "symbol": symbol,
-        "positionIdx": 0,
-    }
-    if sl is not None:
-        body["stopLoss"] = str(sl)
-        body["slTriggerBy"] = "MarkPrice"
-    if tp is not None:
-        body["takeProfit"] = str(tp)
-        body["tpTriggerBy"] = "MarkPrice"
-    return req("POST", "/v5/position/trading-stop", body=body)
+def send_open_alert(setup: dict, qty: float, wallet: float, sl: float, tp: float) -> None:
+    gross_tp, fees_tp, net_tp = net_pnl_estimate(setup["side"], setup["price"], tp, qty)
+    direction = "LONG" if setup["side"] == "Buy" else "SHORT"
+    send_telegram(
+        f"🚀 HIGHER TF SWING TRADE OPENED\n"
+        f"Pair: {setup['symbol']}\n"
+        f"Side: {direction}\n"
+        f"Reason: {setup['reason']}\n"
+        f"Entry: {setup['price']:.8f}\n"
+        f"SL: {sl}\n"
+        f"TP: {tp}\n"
+        f"Qty: {qty}\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"Sizing: {POSITION_PCT*100:.0f}% wallet\n"
+        f"Wallet: {wallet:.4f} USDT\n"
+        f"Est Gross TP: {gross_tp:.6f} USDT\n"
+        f"Est Fees TP: {fees_tp:.6f} USDT\n"
+        f"Est Net TP: {net_tp:.6f} USDT"
+    )
 
 
-# ============================================================
-# DISPLAY / RESULT
-# ============================================================
-def print_trade_details(symbol: str, action: str, side: str, entry: float, sl: float, tp: float, qty: float, sizing_balance_usdt: float) -> None:
-    risk_usdt = abs(entry - sl) * qty
-    gross_tp, fees_tp, net_tp = net_pnl_estimate(side, entry, tp, qty)
-    risk_pct = (risk_usdt / sizing_balance_usdt * 100) if sizing_balance_usdt else 0
-    direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
-
-    print("\n" + "=" * 72)
-    print(action)
-    print("=" * 72)
-    print(f"Pair        : {symbol}")
-    print(f"Direction   : {direction}")
-    print(f"Entry       : {entry:.6f}")
-    print(f"SL          : {sl:.6f}")
-    print(f"TP          : {tp:.6f}")
-    print(f"Qty         : {qty}")
-    print(f"Leverage    : {LEVERAGE}x")
-    print(f"Sizing Bal  : {sizing_balance_usdt:.6f} USDT")
-    print(f"Risk        : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
-    print(f"Est GrossTP : {gross_tp:.6f} USDT")
-    print(f"Est FeesTP  : {fees_tp:.6f} USDT")
-    print(f"Est NetTP   : {net_tp:.6f} USDT")
-    print("=" * 72 + "\n")
-
-
-def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, float | None, float | None, float | None]:
-    symbol = state.get("symbol")
-    side = state.get("pos")
-    entry = state.get("entry")
+def estimate_close_from_state(state: dict, last_price: float | None) -> tuple[str, float, float, float]:
+    if last_price is None:
+        return "Position Closed", 0.0, 0.0, 0.0
+    side = state.get("side")
+    entry = float(state.get("entry") or 0)
+    qty = float(state.get("qty") or 0)
     tp = state.get("tp")
     sl = state.get("sl")
-    qty = state.get("remaining_qty") or state.get("size")
-
-    if not symbol or not side or entry is None or qty is None or last_price is None:
-        return ("Position Closed", None, None, None)
-
     reason = "Position Closed"
-
     if tp is not None and sl is not None:
-        reason = "🎯 TP HIT" if abs(last_price - tp) <= abs(last_price - sl) else "❌ SL HIT"
-
+        reason = "TP HIT" if abs(last_price - float(tp)) <= abs(last_price - float(sl)) else "SL HIT"
     gross, fees, net = net_pnl_estimate(side, entry, last_price, qty)
     return reason, gross, fees, net
 
 
-# ============================================================
-# POSITION MANAGEMENT
-# ============================================================
-def manage_open_position(state: dict, actual_pos: dict) -> str:
-    symbol = actual_pos["symbol"]
-    side = actual_pos["side"]
+def handle_closed_position(state: dict, wallet: float | None) -> None:
+    symbol = state.get("symbol")
+    last_price = get_price(symbol) if symbol else None
+    reason, gross, fees, net = estimate_close_from_state(state, last_price)
 
-    last_price = get_price(symbol)
-    mark_price = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else None
-    current_price = last_price if last_price is not None else (mark_price if mark_price is not None else actual_pos["entry"])
+    new_state = default_state()
+    new_state["last_heartbeat_at"] = state.get("last_heartbeat_at")
+    new_state["last_closed_at"] = time.time()
+    new_state["daily_date"] = state.get("daily_date")
+    new_state["daily_start_wallet"] = state.get("daily_start_wallet")
+    new_state["daily_realized_pnl"] = float(state.get("daily_realized_pnl") or 0.0) + net
+    new_state["daily_loss_stopped"] = bool(state.get("daily_loss_stopped"))
 
-    entry = float(state.get("entry") or actual_pos["entry"])
-    size = float(actual_pos["size"])
-    initial_risk = state.get("initial_risk")
+    if net < 0:
+        new_state["consecutive_losses"] = int(state.get("consecutive_losses") or 0) + 1
+    else:
+        new_state["consecutive_losses"] = 0
 
-    state["symbol"] = symbol
-    state["pos"] = side
-    state["size"] = size
-    state["remaining_qty"] = size
-    if state.get("entry") is None:
-        state["entry"] = float(actual_pos["entry"])
-    save_state(state)
+    daily_start = new_state.get("daily_start_wallet") or wallet
+    if daily_start and new_state["daily_realized_pnl"] <= -(float(daily_start) * DAILY_LOSS_STOP_PCT):
+        new_state["daily_loss_stopped"] = True
 
-    gross_now, fees_now, net_now = net_pnl_estimate(side, entry, current_price, size)
-    log(
-        "POSITION",
-        f"{symbol} | {side} | entry={entry:.6f} current={current_price:.6f} "
-        f"gross={gross_now:+.6f} fees={fees_now:.6f} net={net_now:+.6f}"
+    if new_state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+        new_state["paused_after_losses"] = True
+
+    save_state(new_state)
+
+    send_telegram(
+        f"✅ HIGHER TF SWING POSITION CLOSED\n"
+        f"Reason: {reason}\n"
+        f"Pair: {symbol}\n"
+        f"Side: {state.get('side')}\n"
+        f"Entry: {state.get('entry')}\n"
+        f"Exit Price: {last_price}\n"
+        f"Qty: {state.get('qty')}\n"
+        f"Gross PnL: {gross:.6f} USDT\n"
+        f"Fees Est: {fees:.6f} USDT\n"
+        f"Net PnL Est: {net:.6f} USDT\n"
+        f"Daily Realized: {new_state['daily_realized_pnl']:.6f} USDT\n"
+        f"Consecutive Losses: {new_state['consecutive_losses']}"
     )
+    log("CLOSE", f"{symbol} {reason} gross={gross:.6f} fees={fees:.6f} net={net:.6f}")
 
-    if not initial_risk or initial_risk <= 0:
-        return f"Position running on {symbol}"
 
-    current_r = ((current_price - entry) / initial_risk) if side == "Buy" else ((entry - current_price) / initial_risk)
+def maybe_send_heartbeat(state: dict, wallet: float | None, actual_pos: dict | None, status: str) -> None:
+    now_ts = time.time()
+    last = state.get("last_heartbeat_at")
+    try:
+        if last is not None and now_ts - float(last) < HEARTBEAT_INTERVAL_SECONDS:
+            return
+    except Exception:
+        pass
 
-    if not state.get("partial_taken") and current_r >= PARTIAL_AT_R:
-        instrument = get_instrument_info(symbol)
-        if instrument:
-            partial_qty = floor_to_step(size * PARTIAL_CLOSE_PCT, instrument["qty_step"])
-            if partial_qty >= instrument["min_order_qty"] and partial_qty < size:
-                r = reduce_position(symbol, side, partial_qty)
-                if r.get("retCode") == 0:
-                    gross_part, fees_part, net_part = net_pnl_estimate(side, entry, current_price, partial_qty)
+    wallet_text = "N/A" if wallet is None else f"{wallet:.4f} USDT"
+    if actual_pos:
+        pos_text = f"{actual_pos['symbol']} {actual_pos['side']} size={actual_pos['size']} entry={actual_pos['entry']}"
+    else:
+        pos_text = "No open position"
 
-                    state["partial_taken"] = True
-                    state["partial_qty"] = partial_qty
-                    state["remaining_qty"] = max(size - partial_qty, instrument["min_order_qty"])
-                    save_state(state)
-
-                    send_telegram(
-                        f"💰 PARTIAL TP TAKEN\n"
-                        f"Pair: {symbol}\n"
-                        f"Side: {side}\n"
-                        f"Entry: {entry}\n"
-                        f"Current Price: {current_price}\n"
-                        f"Closed Qty: {partial_qty}\n"
-                        f"Remaining Qty: {state['remaining_qty']}\n"
-                        f"Gross Partial: {gross_part:.6f} USDT\n"
-                        f"Est. Fees: {fees_part:.6f} USDT\n"
-                        f"Est. Net Partial: {net_part:.6f} USDT\n"
-                        f"Triggered At: {current_r:.2f}R"
-                    )
-
-                    log("PARTIAL", f"{symbol} -> partial closed qty={partial_qty} at {current_r:.2f}R")
-
-    if state.get("partial_taken") and not state.get("breakeven_moved"):
-        instrument = get_instrument_info(symbol)
-        if instrument:
-            be_sl = fee_adjusted_be_price(entry, side, instrument["tick_size"])
-            r = update_trading_stop(symbol, sl=be_sl)
-            if r.get("retCode") == 0:
-                state["sl"] = be_sl
-                state["breakeven_moved"] = True
-                save_state(state)
-
-                send_telegram(
-                    f"🛡️ SL MOVED TO FEE-ADJUSTED BE\n"
-                    f"Pair: {symbol}\n"
-                    f"Side: {side}\n"
-                    f"New SL: {be_sl}"
-                )
-                log("BE", f"{symbol} -> moved SL to fee-adjusted BE")
-
-    return f"Position running on {symbol}"
+    send_telegram(
+        f"✅ HIGHER TF SWING HEARTBEAT\n"
+        f"Version: {VERSION}\n"
+        f"Status: {status}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
+        f"Wallet: {wallet_text}\n"
+        f"Position: {pos_text}\n"
+        f"Daily Realized: {float(state.get('daily_realized_pnl') or 0.0):.6f} USDT\n"
+        f"Consecutive Losses: {state.get('consecutive_losses')}\n"
+        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    state["last_heartbeat_at"] = now_ts
+    save_state(state)
 
 
 # ============================================================
 # CORE
 # ============================================================
+def trading_allowed(state: dict) -> tuple[bool, str]:
+    if state.get("paused_after_losses"):
+        return False, "paused after max losing streak until manual state reset"
+    if state.get("daily_loss_stopped"):
+        return False, "daily loss stop active"
+    if state.get("last_closed_at"):
+        elapsed = time.time() - float(state["last_closed_at"])
+        if elapsed < COOLDOWN_SECONDS:
+            remaining = int((COOLDOWN_SECONDS - elapsed) / 60)
+            return False, f"cooldown active ({remaining} min left)"
+    return True, "allowed"
+
+
+def sync_state_with_actual_position(state: dict, actual_pos: dict | None, wallet: float | None) -> dict:
+    if actual_pos:
+        state["symbol"] = actual_pos["symbol"]
+        state["side"] = actual_pos["side"]
+        state["qty"] = actual_pos["size"]
+        if state.get("entry") is None:
+            state["entry"] = actual_pos["entry"]
+        save_state(state)
+        return state
+
+    if state.get("symbol") and state.get("side"):
+        handle_closed_position(state, wallet)
+        return load_state()
+
+    return state
+
+
 def run() -> str:
+    if not require_api_keys():
+        return "Missing API keys"
+
     state = load_state()
-    now_ts = time.time()
+    wallet = get_balance()
+    reset_daily_if_needed(state, wallet)
 
     actual_pos = find_any_open_position()
+    state = sync_state_with_actual_position(state, actual_pos, wallet)
+
     if actual_pos:
-        maybe_send_heartbeat(state, balance=None, actual_pos=actual_pos, status="Managing open position")
-        return manage_open_position(state, actual_pos)
+        maybe_send_heartbeat(state, wallet, actual_pos, "Managing open position")
+        log("POSITION", f"{actual_pos['symbol']} {actual_pos['side']} size={actual_pos['size']} entry={actual_pos['entry']}")
+        return f"Position running on {actual_pos['symbol']}"
 
-    if state.get("pos"):
-        symbol = state.get("symbol")
-        last_price = get_price(symbol) if symbol else None
-        close_reason, gross, fees, net = estimate_close_result(state, last_price)
+    maybe_send_heartbeat(state, wallet, None, "Scanning")
 
-        partial_text = ""
-        if state.get("partial_taken"):
-            partial_text = f"\nPartial Closed: Yes\nPartial Qty: {state.get('partial_qty')}"
+    allowed, reason = trading_allowed(state)
+    if not allowed:
+        log("GUARD", reason)
+        return reason
 
-        gross_text = "N/A" if gross is None else f"{gross:.6f} USDT"
-        fees_text = "N/A" if fees is None else f"{fees:.6f} USDT"
-        net_text = "N/A" if net is None else f"{net:.6f} USDT"
-
-        send_telegram(
-            f"{close_reason}\n"
-            f"Pair: {state.get('symbol')}\n"
-            f"Side: {state.get('pos')}\n"
-            f"Entry: {state.get('entry')}\n"
-            f"TP: {state.get('tp')}\n"
-            f"SL: {state.get('sl')}\n"
-            f"Exit Price: {last_price}\n"
-            f"Qty: {state.get('size')}\n"
-            f"Gross PnL: {gross_text}\n"
-            f"Est. Fees: {fees_text}\n"
-            f"Est. Net PnL: {net_text}"
-            f"{partial_text}"
-        )
-
-        log("CLOSE", f"{close_reason} | {symbol} | gross={gross_text} fees={fees_text} net={net_text}")
-
-        new_state = default_state()
-        new_state["last_heartbeat_at"] = state.get("last_heartbeat_at")
-        new_state["last_closed_at"] = now_ts
-        new_state["last_closed_symbol"] = state.get("symbol")
-        new_state["last_closed_side"] = state.get("pos")
-        new_state["last_closed_price"] = last_price
-        new_state["last_close_reason"] = close_reason
-        save_state(new_state)
-        state = new_state
-
-    if state.get("last_closed_at"):
-        elapsed = now_ts - float(state["last_closed_at"])
-        cooldown_sec = COOLDOWN_MINUTES * 60
-        if elapsed < cooldown_sec:
-            remaining = int((cooldown_sec - elapsed) / 60)
-            return f"Cooldown active ({remaining} min left)"
-
-    actual_balance = get_balance()
-    if actual_balance is None or actual_balance <= 0:
-        return "No balance"
-
-    maybe_send_heartbeat(state, balance=actual_balance, actual_pos=None, status="Running / scanning setups")
-
-    sizing_balance = actual_balance
+    if wallet is None or wallet <= 0:
+        return "No wallet balance"
 
     for symbol in SYMBOLS:
         setup = scan_symbol(symbol)
         if not setup:
             continue
 
-        price = setup["price"]
-        side = setup["side"]
-        reason = setup["reason"]
-        signal_atr = setup["atr"]
-
         instrument = get_instrument_info(symbol)
         if not instrument:
+            log("SKIP", f"{symbol}: instrument info unavailable")
             continue
 
         sl = round_price(setup["sl"], instrument["tick_size"])
         tp = round_price(setup["tp"], instrument["tick_size"])
-
         if sl <= 0 or tp <= 0:
+            log("SKIP", f"{symbol}: invalid rounded SL/TP sl={sl} tp={tp}")
             continue
 
-        initial_risk = abs(price - sl)
-        if initial_risk <= 0:
-            continue
-
-        qty = build_order_qty(symbol, sizing_balance, price)
+        qty = build_order_qty(symbol, wallet, setup["price"])
         if qty is None or qty <= 0:
+            log("SKIP", f"{symbol}: invalid qty {qty}")
             continue
 
-        if (
-            state.get("last_closed_symbol") == symbol
-            and state.get("last_closed_side") == side
-            and state.get("last_closed_price") is not None
-            and state.get("last_closed_at") is not None
-        ):
-            elapsed_close = now_ts - float(state["last_closed_at"])
-            if elapsed_close <= REENTRY_BLOCK_MINUTES * 60:
-                if abs(price - float(state["last_closed_price"])) <= signal_atr * REENTRY_ZONE_ATR_MULT:
-                    log(
-                        "REENTRY_SKIP",
-                        f"{symbol} {side} skipped near same zone | "
-                        f"price={price:.6f} last_close={float(state['last_closed_price']):.6f} atr={signal_atr:.6f}"
-                    )
-                    continue
-
-        gross_tp, fees_tp, net_tp = net_pnl_estimate(side, price, tp, qty)
-        r_multiple = abs(tp - price) / initial_risk if initial_risk > 0 else 0
-        fees_multiple = gross_tp / fees_tp if fees_tp > 0 else 999
-
-        if net_tp < MIN_NET_PROFIT_USDT:
-            log("SKIP", f"{symbol} skipped: est net TP too small ({net_tp:.6f} USDT)")
-            continue
-
-        if r_multiple < MIN_R_MULTIPLE:
-            log("SKIP", f"{symbol} skipped: R multiple too small ({r_multiple:.2f})")
-            continue
-
-        if fees_multiple < MIN_GROSS_TO_FEES_MULTIPLE:
-            log("SKIP", f"{symbol} skipped: gross/fees too small ({fees_multiple:.2f})")
-            continue
-
+        gross_tp, fees_tp, net_tp = net_pnl_estimate(setup["side"], setup["price"], tp, qty)
         log(
-            "DEBUG",
-            f"{symbol} | side={side} | actual_bal={actual_balance:.4f} | price={price:.6f} | "
-            f"qty={qty} | sl={sl} | tp={tp} | gross_tp={gross_tp:.6f} | fees_tp={fees_tp:.6f} | net_tp={net_tp:.6f}"
+            "TRADE_CHECK",
+            f"{symbol} side={setup['side']} entry={setup['price']:.8f} sl={sl} tp={tp} "
+            f"qty={qty} gross_tp={gross_tp:.6f} fees_tp={fees_tp:.6f} net_tp={net_tp:.6f}",
         )
 
-        order_res = place_order(symbol, side, qty, tp, sl)
-        if order_res.get("retCode") != 0:
-            log("ORDER_FAIL", f"{symbol} -> {order_res}")
-            send_telegram(f"❌ ORDER FAILED\n{symbol}\n{order_res}")
+        order = place_order(symbol, setup["side"], qty, tp, sl)
+        if order.get("retCode") != 0:
+            log("ORDER_FAIL", f"{symbol}: {order}")
+            send_telegram(f"❌ HIGHER TF SWING ORDER FAILED\n{symbol}\n{order}")
             continue
 
-        state.update({
-            "symbol": symbol,
-            "pos": side,
-            "entry": price,
-            "sl": sl,
-            "tp": tp,
-            "size": qty,
-            "remaining_qty": qty,
-            "reason": reason,
-            "opened": iso_now(),
-            "initial_risk": initial_risk,
-            "partial_taken": False,
-            "partial_qty": None,
-            "breakeven_moved": False,
-        })
-        save_state(state)
-
-        print_trade_details(symbol, "🚀 TRADE OPENED", side, price, sl, tp, qty, sizing_balance)
-
-        direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
-        send_telegram(
-            f"🚀 TRADE OPENED\n"
-            f"Pair: {symbol}\n"
-            f"Direction: {direction}\n"
-            f"Reason: {reason}\n"
-            f"Entry: {price:.6f}\n"
-            f"SL: {sl}\n"
-            f"TP: {tp}\n"
-            f"Qty: {qty}\n"
-            f"Leverage: {LEVERAGE}x\n"
-            f"Actual Balance: {actual_balance:.4f} USDT\n"
-            f"Sizing Balance: {sizing_balance:.4f} USDT\n"
-            f"Est. Gross TP: {gross_tp:.6f} USDT\n"
-            f"Est. Fees TP: {fees_tp:.6f} USDT\n"
-            f"Est. Net TP: {net_tp:.6f} USDT\n"
-            f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R"
-        )
-
+        update_state_open(state, setup, qty, sl, tp)
+        send_open_alert(setup, qty, wallet, sl, tp)
         return f"Trade opened on {symbol}"
 
     return "No setup"
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main() -> None:
     log("VERSION", VERSION)
-    log("CONFIG", f"ATR_PERIOD={ATR_PERIOD} | POSITION_PCT={POSITION_PCT} | DYNAMIC_WALLET_SIZING=ON")
     log("BOT", "=" * 88)
-    log("BOT", "V5 MULTI-PAIR | 1H EMA200 + 15M BREAKOUT RETEST | BOTH SIDES")
+    log("BOT", "HIGHER TF SWING | 4H EMA200 TREND + 1H EMA20/50 PULLBACK | BOTH SIDES")
     log("BOT", f"Pairs: {', '.join(SYMBOLS)}")
-    log("BOT", f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m")
-    log("BOT", f"Dynamic Wallet Sizing: {int(POSITION_PCT * 100)}% of actual wallet | Leverage: {LEVERAGE}x")
-    log("BOT", f"RR: 1:{RR_RATIO} | Cooldown: {COOLDOWN_MINUTES} min | Check Interval: {CHECK_INTERVAL_SECONDS}s")
-    log("BOT", f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R")
-    log("BOT", f"Range Lookback: {RANGE_LOOKBACK} | Min ATR%: {MIN_ATR_PCT}")
-    log("BOT", f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR} | Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}")
-    log("BOT", f"Confirm Tolerance ATR: {CONFIRM_TOLERANCE_ATR} | Entry Extension ATR: {ENTRY_EXTENSION_ATR}")
-    log("BOT", f"Gross/Fees Min: {MIN_GROSS_TO_FEES_MULTIPLE} | Reentry Block: {REENTRY_BLOCK_MINUTES} min")
-    log("BOT", f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours")
+    log("BOT", f"Leverage: {LEVERAGE}x | Position sizing: {POSITION_PCT*100:.0f}% wallet | RR: {RR_RATIO}")
+    log("BOT", f"Cooldown: {int(COOLDOWN_SECONDS/3600)}h | Check interval: {int(CHECK_INTERVAL_SECONDS/60)}m")
+    log("BOT", f"Daily loss stop: {DAILY_LOSS_STOP_PCT*100:.1f}% | Max consecutive losses: {MAX_CONSECUTIVE_LOSSES}")
     log("BOT", "=" * 88)
+
+    if not require_api_keys():
+        return
 
     for symbol in SYMBOLS:
         set_leverage(symbol)
-        time.sleep(0.8)
-
-    startup_msg = (
-        f"🤖 V5 MULTI-PAIR BOT STARTED\n"
-        f"Version: {VERSION}\n"
-        f"Pairs: {', '.join(SYMBOLS)}\n"
-        f"Trend TF: {TREND_INTERVAL}m | Entry TF: {ENTRY_INTERVAL}m\n"
-        f"Dynamic Wallet Sizing: {int(POSITION_PCT*100)}% of actual wallet\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"Cooldown: {COOLDOWN_MINUTES} min\n"
-        f"Check Interval: {CHECK_INTERVAL_SECONDS}s\n"
-        f"Partial: {int(PARTIAL_CLOSE_PCT*100)}% at {PARTIAL_AT_R}R\n"
-        f"ATR_PERIOD: {ATR_PERIOD}\n"
-        f"Range Lookback: {RANGE_LOOKBACK}\n"
-        f"Breakout Buffer ATR: {BREAKOUT_BUFFER_ATR}\n"
-        f"Retest Tolerance ATR: {RETEST_TOLERANCE_ATR}\n"
-        f"Confirm Tolerance ATR: {CONFIRM_TOLERANCE_ATR}\n"
-        f"Entry Extension ATR: {ENTRY_EXTENSION_ATR}\n"
-        f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
-        f"Mode: 1 active trade only"
-    )
-    send_telegram(startup_msg)
+        time.sleep(0.5)
 
     state = load_state()
     state["last_heartbeat_at"] = time.time()
     save_state(state)
+
+    send_telegram(
+        f"🤖 HIGHER TF SWING BOT STARTED\n"
+        f"Version: {VERSION}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
+        f"Strategy: 4H EMA200 trend + 1H EMA20/50 pullback\n"
+        f"Sides: Long and Short\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"Sizing: {POSITION_PCT*100:.0f}% actual wallet\n"
+        f"RR: {RR_RATIO}\n"
+        f"Cooldown: {int(COOLDOWN_SECONDS/3600)}h\n"
+        f"Daily loss stop: {DAILY_LOSS_STOP_PCT*100:.1f}%\n"
+        f"Max losing streak stop: {MAX_CONSECUTIVE_LOSSES}\n"
+        f"Mode: one open trade only"
+    )
 
     while True:
         try:
@@ -977,8 +714,8 @@ def main() -> None:
             time.sleep(CHECK_INTERVAL_SECONDS)
         except Exception as e:
             log("ERROR", str(e))
-            send_telegram(f"⚠️ BOT ERROR\n{e}")
-            time.sleep(10)
+            send_telegram(f"⚠️ HIGHER TF SWING BOT ERROR\n{e}")
+            time.sleep(30)
 
 
 if __name__ == "__main__":
