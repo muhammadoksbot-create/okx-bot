@@ -18,7 +18,7 @@ VERSION = "SMC_BOS_RETEST_V1"
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_smc_bos_retest.json"
 
-SYMBOLS = ["DOGEUSDT", "XLMUSDT", "HBARUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
+SYMBOLS = ["DOGEUSDT", "XLMUSDT", "HBARUSDT", "BTCUSDT", "ETHUSDT", "AAVEUSDT"]
 CATEGORY = "linear"
 
 ENTRY_INTERVAL = "60"
@@ -43,11 +43,23 @@ VOLUME_SMA_PERIOD = 20
 MIN_ATR_PCT = 0.003
 
 TAKER_FEE_RATE = 0.00055
+MAX_SL_RISK_PCT = 0.03
 DAILY_LOSS_STOP_PCT = 0.08
-MAX_CONSECUTIVE_LOSSES = 11
+MAX_CONSECUTIVE_LOSSES = 5
+LOSS_PAUSE_SECONDS = 24 * 60 * 60
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
+
+SEEDED_PAIR_STATS = {
+    "BTCUSDT": {"trades": 4, "tp": 2, "sl": 2, "net": -0.866242},
+    "XLMUSDT": {"trades": 5, "tp": 1, "sl": 4, "net": 0.114879},
+    "ETHUSDT": {"trades": 2, "tp": 1, "sl": 1, "net": 0.535746},
+    "DOGEUSDT": {"trades": 2, "tp": 1, "sl": 1, "net": 0.122090},
+    "HBARUSDT": {"trades": 1, "tp": 1, "sl": 0, "net": 0.445959},
+    "SOLUSDT": {"trades": 1, "tp": 0, "sl": 1, "net": -0.126064},
+    "AAVEUSDT": {"trades": 0, "tp": 0, "sl": 0, "net": 0.0},
+}
 
 
 # ============================================================
@@ -145,6 +157,10 @@ def req(method: str, path: str, params: dict | None = None, body: dict | None = 
 # ============================================================
 # STATE
 # ============================================================
+def seeded_pair_stats() -> dict:
+    return {symbol: stats.copy() for symbol, stats in SEEDED_PAIR_STATS.items()}
+
+
 def default_state() -> dict:
     return {
         "symbol": None,
@@ -165,9 +181,62 @@ def default_state() -> dict:
         "daily_start_wallet": None,
         "daily_realized_pnl": 0.0,
         "daily_loss_stop_active": False,
-        "consecutive_losses": 0,
-        "loss_streak_pause": False,
+        "total_closed_trades": 14,
+        "total_tp_hits": 6,
+        "total_sl_hits": 8,
+        "total_net_pnl": 0.2264,
+        "current_consecutive_losses": 5,
+        "max_consecutive_losses_seen": 5,
+        "latest_balance": 26.1750,
+        "loss_pause_until": None,
+        "loss_pause_applied_at_streak": None,
+        "pair_stats": seeded_pair_stats(),
     }
+
+
+def migrate_state(state: dict) -> dict:
+    migrated = default_state()
+    migrated.update(state)
+
+    migrated["total_closed_trades"] = int(migrated.get("total_closed_trades", 14) or 14)
+    migrated["total_tp_hits"] = int(migrated.get("total_tp_hits", 6) or 6)
+    migrated["total_sl_hits"] = int(migrated.get("total_sl_hits", 8) or 8)
+    migrated["total_net_pnl"] = float(migrated.get("total_net_pnl", 0.2264) or 0.2264)
+    migrated["latest_balance"] = float(migrated.get("latest_balance", 26.1750) or 26.1750)
+
+    if "current_consecutive_losses" not in state:
+        migrated["current_consecutive_losses"] = int(state.get("consecutive_losses", 5) or 5)
+    else:
+        migrated["current_consecutive_losses"] = int(migrated.get("current_consecutive_losses") or 0)
+
+    migrated["max_consecutive_losses_seen"] = max(
+        int(migrated.get("max_consecutive_losses_seen", 5) or 5),
+        int(migrated.get("current_consecutive_losses", 0) or 0),
+    )
+    applied_at = migrated.get("loss_pause_applied_at_streak")
+    migrated["loss_pause_applied_at_streak"] = None if applied_at is None else int(applied_at)
+
+    pair_stats = migrated.get("pair_stats")
+    if not isinstance(pair_stats, dict):
+        pair_stats = {}
+
+    for symbol, seeded in SEEDED_PAIR_STATS.items():
+        existing = pair_stats.get(symbol)
+        if not isinstance(existing, dict):
+            pair_stats[symbol] = seeded.copy()
+            continue
+
+        for key, value in seeded.items():
+            existing.setdefault(key, value)
+
+        existing["trades"] = int(existing.get("trades") or 0)
+        existing["tp"] = int(existing.get("tp") or 0)
+        existing["sl"] = int(existing.get("sl") or 0)
+        existing["net"] = float(existing.get("net") or 0.0)
+
+    migrated["pair_stats"] = pair_stats
+
+    return migrated
 
 
 def load_state() -> dict:
@@ -177,9 +246,7 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        state = default_state()
-        state.update(data)
-        return state
+        return migrate_state(data)
     except Exception:
         return default_state()
 
@@ -231,11 +298,74 @@ def daily_loss_limit_hit(state: dict) -> bool:
             f"Version: {VERSION}\n"
             f"Daily Start Wallet: {float(start_wallet):.4f} USDT\n"
             f"Realized Today: {realized:.4f} USDT\n"
-            f"Limit: -{DAILY_LOSS_STOP_PCT * 100:.1f}%"
+            f"Limit: -{DAILY_LOSS_STOP_PCT * 100:.1f}%\n\n"
+            f"{bot_record_text(state)}"
         )
         return True
 
     return False
+
+
+def loss_pause_active(state: dict) -> bool:
+    pause_until = state.get("loss_pause_until")
+    if pause_until is None:
+        return False
+
+    try:
+        if time.time() < float(pause_until):
+            return True
+    except Exception:
+        return False
+
+    state["loss_pause_until"] = None
+    save_state(state)
+    return False
+
+
+def apply_loss_pause_if_needed(state: dict) -> None:
+    current_losses = int(state.get("current_consecutive_losses") or 0)
+
+    if current_losses < MAX_CONSECUTIVE_LOSSES:
+        return
+
+    applied_at = state.get("loss_pause_applied_at_streak")
+    if applied_at is not None:
+        try:
+            if int(applied_at) == current_losses:
+                return
+        except Exception:
+            pass
+
+    pause_until = state.get("loss_pause_until")
+    if pause_until is not None:
+        try:
+            if time.time() < float(pause_until):
+                return
+        except Exception:
+            pass
+
+    state["loss_pause_until"] = time.time() + LOSS_PAUSE_SECONDS
+    state["loss_pause_applied_at_streak"] = current_losses
+    save_state(state)
+
+    send_telegram(
+        f"LOSS STREAK PAUSE ACTIVE\n"
+        f"Version: {VERSION}\n"
+        f"Consecutive Losses: {current_losses}\n"
+        f"Pause Until: {format_pause_until(state)}\n\n"
+        f"{bot_record_text(state)}"
+    )
+
+
+def format_pause_until(state: dict) -> str:
+    pause_until = state.get("loss_pause_until")
+    if pause_until is None:
+        return "N/A"
+
+    try:
+        return datetime.fromtimestamp(float(pause_until), UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return "N/A"
 
 
 # ============================================================
@@ -304,10 +434,19 @@ def get_instrument_info(symbol: str) -> dict | None:
 
     try:
         info = r["result"]["list"][0]
+        lot_filter = info["lotSizeFilter"]
+        price_filter = info["priceFilter"]
+        min_notional = (
+            lot_filter.get("minNotionalValue")
+            or lot_filter.get("minOrderAmt")
+            or lot_filter.get("minOrderValue")
+            or 0
+        )
         return {
-            "qty_step": float(info["lotSizeFilter"]["qtyStep"]),
-            "min_order_qty": float(info["lotSizeFilter"]["minOrderQty"]),
-            "tick_size": float(info["priceFilter"]["tickSize"]),
+            "qty_step": float(lot_filter["qtyStep"]),
+            "min_order_qty": float(lot_filter["minOrderQty"]),
+            "min_notional": float(min_notional or 0),
+            "tick_size": float(price_filter["tickSize"]),
         }
     except Exception:
         return None
@@ -372,6 +511,12 @@ def floor_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 
+def ceil_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.ceil(value / step) * step
+
+
 def round_price(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
@@ -429,6 +574,11 @@ def net_pnl_estimate(side: str, entry: float, exit_price: float, qty: float) -> 
     return gross, fees, net
 
 
+def estimated_sl_loss(side: str, entry: float, sl: float, qty: float) -> float:
+    gross, fees, net = net_pnl_estimate(side, entry, sl, qty)
+    return abs(net) if net < 0 else fees
+
+
 def get_last_confirmed_swing(highs: list[float], lows: list[float], length: int) -> tuple[float | None, float | None]:
     last_swing_high = None
     last_swing_low = None
@@ -472,6 +622,54 @@ def symbol_4h_trend(symbol: str) -> tuple[bool, bool, str]:
     )
 
     return trend_up, trend_down, detail
+
+
+# ============================================================
+# BOT RECORD / TELEGRAM REPORTING
+# ============================================================
+def win_rate(total: int, tp_hits: int) -> float:
+    return (tp_hits / total * 100) if total > 0 else 0.0
+
+
+def bot_record_text(state: dict) -> str:
+    closed = int(state.get("total_closed_trades") or 0)
+    tp_hits = int(state.get("total_tp_hits") or 0)
+    sl_hits = int(state.get("total_sl_hits") or 0)
+    loss_streak = int(state.get("current_consecutive_losses") or 0)
+    pause_active = loss_pause_active(state)
+
+    lines = [
+        "BOT RECORD",
+        f"Closed: {closed}",
+        f"TP: {tp_hits}",
+        f"SL: {sl_hits}",
+        f"Win Rate: {win_rate(closed, tp_hits):.2f}%",
+        f"Total Net PnL: {float(state.get('total_net_pnl') or 0.0):.6f} USDT",
+        f"Loss Streak: {loss_streak}",
+        f"Max Loss Streak: {int(state.get('max_consecutive_losses_seen') or 0)}",
+        f"Daily Stop: {state.get('daily_loss_stop_active')}",
+        f"Loss Pause: {pause_active}",
+        f"Pause Until: {format_pause_until(state) if pause_active else 'N/A'}",
+        f"Active Pairs: {', '.join(SYMBOLS)}",
+    ]
+
+    return "\n".join(lines)
+
+
+def pair_record_text(state: dict, symbol: str) -> str:
+    pair_stats = state.get("pair_stats") or {}
+    stats = pair_stats.get(symbol, {"trades": 0, "tp": 0, "sl": 0, "net": 0.0})
+    trades = int(stats.get("trades") or 0)
+    tp_hits = int(stats.get("tp") or 0)
+    sl_hits = int(stats.get("sl") or 0)
+
+    return (
+        f"Pair Trades: {trades}\n"
+        f"Pair TP: {tp_hits}\n"
+        f"Pair SL: {sl_hits}\n"
+        f"Pair Win Rate: {win_rate(trades, tp_hits):.2f}%\n"
+        f"Pair Net PnL: {float(stats.get('net') or 0.0):.6f} USDT"
+    )
 
 
 # ============================================================
@@ -601,13 +799,7 @@ def scan_symbol(symbol: str) -> dict | None:
 # ============================================================
 # ORDER MANAGEMENT
 # ============================================================
-def build_order_qty(symbol: str, sizing_balance_usdt: float, price: float) -> float | None:
-    instrument = get_instrument_info(symbol)
-
-    if not instrument:
-        log("SIZE", f"{symbol} -> instrument info failed")
-        return None
-
+def build_order_qty_from_instrument(instrument: dict, sizing_balance_usdt: float, price: float) -> float | None:
     position_value = sizing_balance_usdt * POSITION_PCT
     exposure = position_value * LEVERAGE
     raw_qty = exposure / price
@@ -616,6 +808,10 @@ def build_order_qty(symbol: str, sizing_balance_usdt: float, price: float) -> fl
 
     if qty < instrument["min_order_qty"]:
         qty = instrument["min_order_qty"]
+
+    min_notional = float(instrument.get("min_notional") or 0)
+    if min_notional > 0 and qty * price < min_notional:
+        qty = ceil_to_step(min_notional / price, instrument["qty_step"])
 
     return round(qty, 8)
 
@@ -671,14 +867,10 @@ def maybe_send_heartbeat(
         f"BOT HEARTBEAT\n"
         f"Version: {VERSION}\n"
         f"Status: {status}\n"
-        f"Pairs: {', '.join(SYMBOLS)}\n"
         f"Balance: {balance_text}\n"
         f"Position: {position_text}\n"
-        f"Daily Realized: {float(state.get('daily_realized_pnl') or 0.0):.4f} USDT\n"
-        f"Consecutive Losses: {int(state.get('consecutive_losses') or 0)}\n"
-        f"Daily Stop Active: {state.get('daily_loss_stop_active')}\n"
-        f"Loss Streak Pause: {state.get('loss_streak_pause')}\n"
-        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        f"{bot_record_text(state)}"
     )
 
     state["last_heartbeat_at"] = now_ts
@@ -695,29 +887,33 @@ def print_trade_details(
     qty: float,
     sizing_balance_usdt: float,
     reason: str,
+    est_sl_loss: float,
 ) -> None:
     risk_usdt = abs(entry - sl) * qty
     gross_tp, fees_tp, net_tp = net_pnl_estimate(side, entry, tp, qty)
     risk_pct = (risk_usdt / sizing_balance_usdt * 100) if sizing_balance_usdt else 0
+    est_sl_risk_pct = (est_sl_loss / sizing_balance_usdt * 100) if sizing_balance_usdt else 0
     direction = "LONG" if side == "Buy" else "SHORT"
 
     print("\n" + "=" * 72)
     print(action)
     print("=" * 72)
-    print(f"Version     : {VERSION}")
-    print(f"Pair        : {symbol}")
-    print(f"Direction   : {direction}")
-    print(f"Reason      : {reason}")
-    print(f"Entry       : {entry:.6f}")
-    print(f"SL          : {sl:.6f}")
-    print(f"TP          : {tp:.6f}")
-    print(f"Qty         : {qty}")
-    print(f"Leverage    : {LEVERAGE}x")
-    print(f"Sizing Bal  : {sizing_balance_usdt:.6f} USDT")
-    print(f"Risk        : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
-    print(f"Est GrossTP : {gross_tp:.6f} USDT")
-    print(f"Est FeesTP  : {fees_tp:.6f} USDT")
-    print(f"Est NetTP   : {net_tp:.6f} USDT")
+    print(f"Version      : {VERSION}")
+    print(f"Pair         : {symbol}")
+    print(f"Direction    : {direction}")
+    print(f"Reason       : {reason}")
+    print(f"Entry        : {entry:.6f}")
+    print(f"SL           : {sl:.6f}")
+    print(f"TP           : {tp:.6f}")
+    print(f"Qty          : {qty}")
+    print(f"Leverage     : {LEVERAGE}x")
+    print(f"Sizing Bal   : {sizing_balance_usdt:.6f} USDT")
+    print(f"Risk         : {risk_usdt:.6f} USDT ({risk_pct:.2f}%)")
+    print(f"Est SL Loss  : {est_sl_loss:.6f} USDT ({est_sl_risk_pct:.2f}%)")
+    print(f"Max Risk     : {MAX_SL_RISK_PCT * 100:.2f}%")
+    print(f"Est GrossTP  : {gross_tp:.6f} USDT")
+    print(f"Est FeesTP   : {fees_tp:.6f} USDT")
+    print(f"Est NetTP    : {net_tp:.6f} USDT")
     print("=" * 72 + "\n")
 
 
@@ -741,23 +937,57 @@ def estimate_close_result(state: dict, last_price: float | None) -> tuple[str, f
     return reason, gross, fees, net
 
 
+def update_stats_on_close(state: dict, close_reason: str, net: float | None) -> None:
+    symbol = state.get("symbol")
+    if not symbol:
+        return
+
+    is_tp = "TP" in close_reason
+    is_sl = "SL" in close_reason
+    net_value = float(net or 0.0)
+
+    state["total_closed_trades"] = int(state.get("total_closed_trades") or 0) + 1
+    state["total_net_pnl"] = float(state.get("total_net_pnl") or 0.0) + net_value
+
+    if is_tp:
+        state["total_tp_hits"] = int(state.get("total_tp_hits") or 0) + 1
+    if is_sl:
+        state["total_sl_hits"] = int(state.get("total_sl_hits") or 0) + 1
+
+    pair_stats = state.setdefault("pair_stats", seeded_pair_stats())
+    stats = pair_stats.setdefault(symbol, {"trades": 0, "tp": 0, "sl": 0, "net": 0.0})
+    stats["trades"] = int(stats.get("trades") or 0) + 1
+    stats["net"] = float(stats.get("net") or 0.0) + net_value
+
+    if is_tp:
+        stats["tp"] = int(stats.get("tp") or 0) + 1
+    if is_sl:
+        stats["sl"] = int(stats.get("sl") or 0) + 1
+
+    if net is not None:
+        state["daily_realized_pnl"] = float(state.get("daily_realized_pnl") or 0.0) + net_value
+
+        if net_value < 0:
+            state["current_consecutive_losses"] = int(state.get("current_consecutive_losses") or 0) + 1
+        else:
+            state["current_consecutive_losses"] = 0
+            state["loss_pause_applied_at_streak"] = None
+
+        state["max_consecutive_losses_seen"] = max(
+            int(state.get("max_consecutive_losses_seen") or 0),
+            int(state.get("current_consecutive_losses") or 0),
+        )
+
+    apply_loss_pause_if_needed(state)
+
+
 def record_closed_trade(state: dict, symbol: str | None, side: str | None, last_price: float | None) -> None:
     close_reason, gross, fees, net = estimate_close_result(state, last_price)
+    update_stats_on_close(state, close_reason, net)
 
     gross_text = "N/A" if gross is None else f"{gross:.6f} USDT"
     fees_text = "N/A" if fees is None else f"{fees:.6f} USDT"
     net_text = "N/A" if net is None else f"{net:.6f} USDT"
-
-    if net is not None:
-        state["daily_realized_pnl"] = float(state.get("daily_realized_pnl") or 0.0) + net
-
-        if net < 0:
-            state["consecutive_losses"] = int(state.get("consecutive_losses") or 0) + 1
-        else:
-            state["consecutive_losses"] = 0
-
-        if int(state.get("consecutive_losses") or 0) >= MAX_CONSECUTIVE_LOSSES:
-            state["loss_streak_pause"] = True
 
     send_telegram(
         f"{close_reason}\n"
@@ -771,9 +1001,9 @@ def record_closed_trade(state: dict, symbol: str | None, side: str | None, last_
         f"Qty: {state.get('size')}\n"
         f"Gross PnL: {gross_text}\n"
         f"Est. Fees: {fees_text}\n"
-        f"Est. Net PnL: {net_text}\n"
-        f"Daily Realized: {float(state.get('daily_realized_pnl') or 0.0):.6f} USDT\n"
-        f"Consecutive Losses: {int(state.get('consecutive_losses') or 0)}"
+        f"Est. Net PnL: {net_text}\n\n"
+        f"{pair_record_text(state, state.get('symbol'))}\n\n"
+        f"{bot_record_text(state)}"
     )
 
     log("CLOSE", f"{close_reason} | {symbol} {side} | gross={gross_text} fees={fees_text} net={net_text}")
@@ -782,22 +1012,28 @@ def record_closed_trade(state: dict, symbol: str | None, side: str | None, last_
 def reset_position_state_after_close(state: dict, last_price: float | None, close_reason: str | None = None) -> dict:
     now_ts = time.time()
 
-    daily_date = state.get("daily_date")
-    daily_start_wallet = state.get("daily_start_wallet")
-    daily_realized_pnl = state.get("daily_realized_pnl")
-    daily_loss_stop_active = state.get("daily_loss_stop_active")
-    consecutive_losses = state.get("consecutive_losses")
-    loss_streak_pause = state.get("loss_streak_pause")
-    last_heartbeat_at = state.get("last_heartbeat_at")
+    keep_keys = {
+        "last_heartbeat_at",
+        "daily_date",
+        "daily_start_wallet",
+        "daily_realized_pnl",
+        "daily_loss_stop_active",
+        "total_closed_trades",
+        "total_tp_hits",
+        "total_sl_hits",
+        "total_net_pnl",
+        "current_consecutive_losses",
+        "max_consecutive_losses_seen",
+        "latest_balance",
+        "loss_pause_until",
+        "loss_pause_applied_at_streak",
+        "pair_stats",
+    }
 
     new_state = default_state()
-    new_state["last_heartbeat_at"] = last_heartbeat_at
-    new_state["daily_date"] = daily_date
-    new_state["daily_start_wallet"] = daily_start_wallet
-    new_state["daily_realized_pnl"] = daily_realized_pnl
-    new_state["daily_loss_stop_active"] = daily_loss_stop_active
-    new_state["consecutive_losses"] = consecutive_losses
-    new_state["loss_streak_pause"] = loss_streak_pause
+    for key in keep_keys:
+        new_state[key] = state.get(key, new_state.get(key))
+
     new_state["last_closed_at"] = now_ts
     new_state["last_closed_symbol"] = state.get("symbol")
     new_state["last_closed_side"] = state.get("pos")
@@ -868,14 +1104,16 @@ def run() -> str:
     if actual_balance is None or actual_balance <= 0:
         return "No balance"
 
+    state["latest_balance"] = actual_balance
     ensure_daily_state(state, actual_balance)
     maybe_send_heartbeat(state, balance=actual_balance, actual_pos=None, status="Running / scanning setups")
 
     if daily_loss_limit_hit(state):
         return "Daily loss stop active"
 
-    if state.get("loss_streak_pause"):
-        return f"Loss streak pause active ({state.get('consecutive_losses')} losses)"
+    apply_loss_pause_if_needed(state)
+    if loss_pause_active(state):
+        return f"Loss streak pause active until {format_pause_until(state)}"
 
     if state.get("last_closed_at"):
         elapsed = time.time() - float(state["last_closed_at"])
@@ -917,10 +1155,31 @@ def run() -> str:
             log("SKIP", f"{symbol} skipped: invalid short geometry entry={price} sl={sl} tp={tp}")
             continue
 
-        qty = build_order_qty(symbol, sizing_balance, price)
+        qty = build_order_qty_from_instrument(instrument, sizing_balance, price)
 
         if qty is None or qty <= 0:
             log("SKIP", f"{symbol} skipped: invalid qty")
+            continue
+
+        est_sl_loss = estimated_sl_loss(side, price, sl, qty)
+        est_sl_risk_pct = est_sl_loss / actual_balance if actual_balance > 0 else 999.0
+
+        if est_sl_risk_pct > MAX_SL_RISK_PCT:
+            direction = "LONG" if side == "Buy" else "SHORT"
+            msg = (
+                f"TRADE SKIPPED - Risk too high\n"
+                f"Pair: {symbol}\n"
+                f"Direction: {direction}\n"
+                f"Entry: {price:.6f}\n"
+                f"SL: {sl}\n"
+                f"Qty: {qty}\n"
+                f"Est SL Loss: {est_sl_loss:.6f} USDT\n"
+                f"Wallet: {actual_balance:.6f} USDT\n"
+                f"Risk %: {est_sl_risk_pct * 100:.2f}%\n"
+                f"Max Risk %: {MAX_SL_RISK_PCT * 100:.2f}%"
+            )
+            log("RISK_SKIP", msg.replace("\n", " | "))
+            send_telegram(msg)
             continue
 
         gross_tp, fees_tp, net_tp = net_pnl_estimate(side, price, tp, qty)
@@ -928,7 +1187,8 @@ def run() -> str:
         log(
             "DEBUG",
             f"{symbol} | side={side} | balance={actual_balance:.4f} | price={price:.6f} | "
-            f"qty={qty} | sl={sl} | tp={tp} | gross_tp={gross_tp:.6f} "
+            f"qty={qty} | sl={sl} | tp={tp} | est_sl_loss={est_sl_loss:.6f} "
+            f"est_sl_risk_pct={est_sl_risk_pct * 100:.2f}% | gross_tp={gross_tp:.6f} "
             f"fees_tp={fees_tp:.6f} net_tp={net_tp:.6f}"
         )
 
@@ -941,7 +1201,8 @@ def run() -> str:
                 f"Version: {VERSION}\n"
                 f"Pair: {symbol}\n"
                 f"Side: {side}\n"
-                f"Response: {order_res}"
+                f"Response: {order_res}\n\n"
+                f"{bot_record_text(state)}"
             )
             continue
 
@@ -954,11 +1215,12 @@ def run() -> str:
             "size": qty,
             "reason": reason,
             "opened": iso_now(),
+            "latest_balance": actual_balance,
         })
 
         save_state(state)
 
-        print_trade_details(symbol, "TRADE OPENED", side, price, sl, tp, qty, sizing_balance, reason)
+        print_trade_details(symbol, "TRADE OPENED", side, price, sl, tp, qty, sizing_balance, reason, est_sl_loss)
 
         direction = "LONG" if side == "Buy" else "SHORT"
 
@@ -972,18 +1234,23 @@ def run() -> str:
             f"Entry: {price:.6f}\n"
             f"SL: {sl}\n"
             f"TP: {tp}\n"
-            f"Qty: {qty}\n"
+            f"Qty after rounding: {qty}\n"
             f"Leverage: {LEVERAGE}x\n"
             f"Actual Balance: {actual_balance:.4f} USDT\n"
             f"Position Sizing: {POSITION_PCT * 100:.1f}%\n"
             f"RR: {RR_RATIO}\n"
+            f"Est SL Loss: {est_sl_loss:.6f} USDT\n"
+            f"Est SL Risk %: {est_sl_risk_pct * 100:.2f}%\n"
+            f"Max Risk %: {MAX_SL_RISK_PCT * 100:.2f}%\n"
             f"Est. Gross TP: {gross_tp:.6f} USDT\n"
             f"Est. Fees TP: {fees_tp:.6f} USDT\n"
-            f"Est. Net TP: {net_tp:.6f} USDT"
+            f"Est. Net TP: {net_tp:.6f} USDT\n\n"
+            f"{bot_record_text(state)}"
         )
 
         return f"Trade opened on {symbol}"
 
+    save_state(state)
     return "No setup"
 
 
@@ -999,41 +1266,34 @@ def main() -> None:
     log("CONFIG", f"ATR_PERIOD={ATR_PERIOD} | MIN_ATR_PCT={MIN_ATR_PCT} | VOLUME_SMA_PERIOD={VOLUME_SMA_PERIOD}")
     log("CONFIG", f"COOLDOWN_HOURS={COOLDOWN_HOURS} | CHECK_INTERVAL_SECONDS={CHECK_INTERVAL_SECONDS}")
     log("CONFIG", f"DAILY_LOSS_STOP_PCT={DAILY_LOSS_STOP_PCT} | MAX_CONSECUTIVE_LOSSES={MAX_CONSECUTIVE_LOSSES}")
+    log("CONFIG", f"MAX_SL_RISK_PCT={MAX_SL_RISK_PCT}")
     log("BOT", "=" * 88)
     log("BOT", "SMC BOS RETEST | 1H STRUCTURE + 4H EMA200 SYMBOL TREND | BOTH SIDES")
     log("BOT", "One active trade only across all symbols")
     log("BOT", "=" * 88)
 
+    state = load_state()
+    save_state(state)
+
     for symbol in SYMBOLS:
+        instrument = get_instrument_info(symbol)
+        if instrument:
+            log(
+                "INSTRUMENT",
+                f"{symbol} tick={instrument['tick_size']} qty_step={instrument['qty_step']} "
+                f"min_qty={instrument['min_order_qty']} min_notional={instrument['min_notional']}"
+            )
+        else:
+            log("INSTRUMENT", f"{symbol} instrument validation failed")
+
         set_leverage(symbol)
         time.sleep(0.8)
 
-    startup_msg = (
-        f"BOT STARTED\n"
-        f"Version: {VERSION}\n"
-        f"Pairs: {', '.join(SYMBOLS)}\n"
-        f"Strategy: SMC BOS Retest\n"
-        f"Entry TF: {ENTRY_INTERVAL}m | Trend TF: {TREND_INTERVAL}m\n"
-        f"Position Sizing: {POSITION_PCT * 100:.1f}% of actual wallet\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"RR: {RR_RATIO}\n"
-        f"Cooldown: {COOLDOWN_HOURS}h\n"
-        f"Swing Length: {SWING_LEN}\n"
-        f"Retest Tolerance: {RETEST_TOLERANCE_ATR} ATR\n"
-        f"ATR Min: {MIN_ATR_PCT}\n"
-        f"Volume Filter: volume > SMA{VOLUME_SMA_PERIOD}\n"
-        f"Daily Loss Stop: {DAILY_LOSS_STOP_PCT * 100:.1f}%\n"
-        f"Max Consecutive Losses Pause: {MAX_CONSECUTIVE_LOSSES}\n"
-        f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
-        f"Mode: 1 active trade only"
-    )
-    send_telegram(startup_msg)
-
-    state = load_state()
-    state["last_heartbeat_at"] = time.time()
-
     balance = get_balance()
+    if balance is not None:
+        state["latest_balance"] = balance
     ensure_daily_state(state, balance)
+    apply_loss_pause_if_needed(state)
 
     actual_pos = find_any_open_position()
     if actual_pos:
@@ -1050,10 +1310,29 @@ def main() -> None:
             f"Pair: {actual_pos['symbol']}\n"
             f"Side: {actual_pos['side']}\n"
             f"Size: {actual_pos['size']}\n"
-            f"Entry: {actual_pos['entry']}"
+            f"Entry: {actual_pos['entry']}\n\n"
+            f"{bot_record_text(state)}"
         )
     else:
         save_state(state)
+
+    send_telegram(
+        f"BOT STARTED\n"
+        f"Version: {VERSION}\n"
+        f"Pairs: {', '.join(SYMBOLS)}\n"
+        f"Strategy: SMC BOS Retest\n"
+        f"Entry TF: {ENTRY_INTERVAL}m | Trend TF: {TREND_INTERVAL}m\n"
+        f"Position Sizing: {POSITION_PCT * 100:.1f}% of actual wallet\n"
+        f"Leverage: {LEVERAGE}x\n"
+        f"RR: {RR_RATIO}\n"
+        f"Cooldown: {COOLDOWN_HOURS}h\n"
+        f"Max SL Risk: {MAX_SL_RISK_PCT * 100:.2f}%\n"
+        f"Daily Loss Stop: {DAILY_LOSS_STOP_PCT * 100:.1f}%\n"
+        f"Max Consecutive Losses Pause: {MAX_CONSECUTIVE_LOSSES} for 24h\n"
+        f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
+        f"Mode: 1 active trade only\n\n"
+        f"{bot_record_text(state)}"
+    )
 
     while True:
         try:
