@@ -45,8 +45,7 @@ MIN_ATR_PCT = 0.003
 TAKER_FEE_RATE = 0.00055
 MAX_SL_RISK_PCT = 0.03
 DAILY_LOSS_STOP_PCT = 0.08
-MAX_CONSECUTIVE_LOSSES = 5
-LOSS_PAUSE_SECONDS = 24 * 60 * 60
+LOSS_WARNING_THRESHOLD = 5
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
@@ -190,6 +189,7 @@ def default_state() -> dict:
         "latest_balance": 26.1750,
         "loss_pause_until": None,
         "loss_pause_applied_at_streak": None,
+        "loss_warning_sent_at_streak": None,
         "pair_stats": seeded_pair_stats(),
     }
 
@@ -213,8 +213,10 @@ def migrate_state(state: dict) -> dict:
         int(migrated.get("max_consecutive_losses_seen", 5) or 5),
         int(migrated.get("current_consecutive_losses", 0) or 0),
     )
-    applied_at = migrated.get("loss_pause_applied_at_streak")
-    migrated["loss_pause_applied_at_streak"] = None if applied_at is None else int(applied_at)
+    migrated["loss_pause_until"] = None
+    migrated["loss_pause_applied_at_streak"] = None
+    warning_at = migrated.get("loss_warning_sent_at_streak")
+    migrated["loss_warning_sent_at_streak"] = None if warning_at is None else int(warning_at)
 
     pair_stats = migrated.get("pair_stats")
     if not isinstance(pair_stats, dict):
@@ -306,53 +308,28 @@ def daily_loss_limit_hit(state: dict) -> bool:
     return False
 
 
-def loss_pause_active(state: dict) -> bool:
-    pause_until = state.get("loss_pause_until")
-    if pause_until is None:
-        return False
-
-    try:
-        if time.time() < float(pause_until):
-            return True
-    except Exception:
-        return False
-
-    state["loss_pause_until"] = None
-    save_state(state)
-    return False
-
-
-def apply_loss_pause_if_needed(state: dict) -> None:
+def send_loss_streak_warning_if_needed(state: dict) -> None:
     current_losses = int(state.get("current_consecutive_losses") or 0)
 
-    if current_losses < MAX_CONSECUTIVE_LOSSES:
+    if current_losses < LOSS_WARNING_THRESHOLD:
         return
 
-    applied_at = state.get("loss_pause_applied_at_streak")
-    if applied_at is not None:
+    warning_at = state.get("loss_warning_sent_at_streak")
+    if warning_at is not None:
         try:
-            if int(applied_at) == current_losses:
+            if int(warning_at) == current_losses:
                 return
         except Exception:
             pass
 
-    pause_until = state.get("loss_pause_until")
-    if pause_until is not None:
-        try:
-            if time.time() < float(pause_until):
-                return
-        except Exception:
-            pass
-
-    state["loss_pause_until"] = time.time() + LOSS_PAUSE_SECONDS
-    state["loss_pause_applied_at_streak"] = current_losses
+    state["loss_warning_sent_at_streak"] = current_losses
     save_state(state)
 
     send_telegram(
-        f"LOSS STREAK PAUSE ACTIVE\n"
-        f"Version: {VERSION}\n"
+        f"LOSS STREAK WARNING\n"
         f"Consecutive Losses: {current_losses}\n"
-        f"Pause Until: {format_pause_until(state)}\n\n"
+        f"Bot is NOT paused\n"
+        f"Trading will continue only if risk <= {MAX_SL_RISK_PCT * 100:.0f}%\n\n"
         f"{bot_record_text(state)}"
     )
 
@@ -636,7 +613,6 @@ def bot_record_text(state: dict) -> str:
     tp_hits = int(state.get("total_tp_hits") or 0)
     sl_hits = int(state.get("total_sl_hits") or 0)
     loss_streak = int(state.get("current_consecutive_losses") or 0)
-    pause_active = loss_pause_active(state)
 
     lines = [
         "BOT RECORD",
@@ -648,8 +624,8 @@ def bot_record_text(state: dict) -> str:
         f"Loss Streak: {loss_streak}",
         f"Max Loss Streak: {int(state.get('max_consecutive_losses_seen') or 0)}",
         f"Daily Stop: {state.get('daily_loss_stop_active')}",
-        f"Loss Pause: {pause_active}",
-        f"Pause Until: {format_pause_until(state) if pause_active else 'N/A'}",
+        f"Risk Filter: {MAX_SL_RISK_PCT * 100:.0f}%",
+        f"Loss Pause: Disabled",
         f"Active Pairs: {', '.join(SYMBOLS)}",
     ]
 
@@ -972,13 +948,14 @@ def update_stats_on_close(state: dict, close_reason: str, net: float | None) -> 
         else:
             state["current_consecutive_losses"] = 0
             state["loss_pause_applied_at_streak"] = None
+            state["loss_warning_sent_at_streak"] = None
 
         state["max_consecutive_losses_seen"] = max(
             int(state.get("max_consecutive_losses_seen") or 0),
             int(state.get("current_consecutive_losses") or 0),
         )
 
-    apply_loss_pause_if_needed(state)
+    send_loss_streak_warning_if_needed(state)
 
 
 def record_closed_trade(state: dict, symbol: str | None, side: str | None, last_price: float | None) -> None:
@@ -1027,6 +1004,7 @@ def reset_position_state_after_close(state: dict, last_price: float | None, clos
         "latest_balance",
         "loss_pause_until",
         "loss_pause_applied_at_streak",
+        "loss_warning_sent_at_streak",
         "pair_stats",
     }
 
@@ -1110,10 +1088,6 @@ def run() -> str:
 
     if daily_loss_limit_hit(state):
         return "Daily loss stop active"
-
-    apply_loss_pause_if_needed(state)
-    if loss_pause_active(state):
-        return f"Loss streak pause active until {format_pause_until(state)}"
 
     if state.get("last_closed_at"):
         elapsed = time.time() - float(state["last_closed_at"])
@@ -1265,7 +1239,7 @@ def main() -> None:
     log("CONFIG", f"SWING_LEN={SWING_LEN} | RETEST_TOLERANCE_ATR={RETEST_TOLERANCE_ATR}")
     log("CONFIG", f"ATR_PERIOD={ATR_PERIOD} | MIN_ATR_PCT={MIN_ATR_PCT} | VOLUME_SMA_PERIOD={VOLUME_SMA_PERIOD}")
     log("CONFIG", f"COOLDOWN_HOURS={COOLDOWN_HOURS} | CHECK_INTERVAL_SECONDS={CHECK_INTERVAL_SECONDS}")
-    log("CONFIG", f"DAILY_LOSS_STOP_PCT={DAILY_LOSS_STOP_PCT} | MAX_CONSECUTIVE_LOSSES={MAX_CONSECUTIVE_LOSSES}")
+    log("CONFIG", f"DAILY_LOSS_STOP_PCT={DAILY_LOSS_STOP_PCT} | LOSS_WARNING_THRESHOLD={LOSS_WARNING_THRESHOLD}")
     log("CONFIG", f"MAX_SL_RISK_PCT={MAX_SL_RISK_PCT}")
     log("BOT", "=" * 88)
     log("BOT", "SMC BOS RETEST | 1H STRUCTURE + 4H EMA200 SYMBOL TREND | BOTH SIDES")
@@ -1293,7 +1267,7 @@ def main() -> None:
     if balance is not None:
         state["latest_balance"] = balance
     ensure_daily_state(state, balance)
-    apply_loss_pause_if_needed(state)
+    send_loss_streak_warning_if_needed(state)
 
     actual_pos = find_any_open_position()
     if actual_pos:
@@ -1328,7 +1302,8 @@ def main() -> None:
         f"Cooldown: {COOLDOWN_HOURS}h\n"
         f"Max SL Risk: {MAX_SL_RISK_PCT * 100:.2f}%\n"
         f"Daily Loss Stop: {DAILY_LOSS_STOP_PCT * 100:.1f}%\n"
-        f"Max Consecutive Losses Pause: {MAX_CONSECUTIVE_LOSSES} for 24h\n"
+        f"Loss Streak Warning: {LOSS_WARNING_THRESHOLD} losses\n"
+        f"Loss Pause: Disabled\n"
         f"Heartbeat: every {int(HEARTBEAT_INTERVAL_SECONDS / 3600)} hours\n"
         f"Mode: 1 active trade only\n\n"
         f"{bot_record_text(state)}"
