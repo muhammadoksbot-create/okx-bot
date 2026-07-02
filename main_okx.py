@@ -18,7 +18,7 @@ VERSION = "SMC_BOS_RETEST_V1"
 BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
 STATE_FILE = "state_smc_bos_retest.json"
 
-SYMBOLS = ["DOGEUSDT", "XLMUSDT", "HBARUSDT", "BTCUSDT", "ETHUSDT", "AAVEUSDT"]
+SYMBOLS = ["DOGEUSDT", "HBARUSDT", "BTCUSDT", "ETHUSDT", "AAVEUSDT", "DOTUSDT", "XRPUSDT"]
 CATEGORY = "linear"
 
 ENTRY_INTERVAL = "60"
@@ -58,6 +58,8 @@ SEEDED_PAIR_STATS = {
     "HBARUSDT": {"trades": 1, "tp": 1, "sl": 0, "net": 0.445959},
     "SOLUSDT": {"trades": 1, "tp": 0, "sl": 1, "net": -0.126064},
     "AAVEUSDT": {"trades": 0, "tp": 0, "sl": 0, "net": 0.0},
+    "DOTUSDT": {"trades": 0, "tp": 0, "sl": 0, "net": 0.0},
+    "XRPUSDT": {"trades": 0, "tp": 0, "sl": 0, "net": 0.0},
 }
 
 
@@ -191,6 +193,11 @@ def default_state() -> dict:
         "loss_pause_applied_at_streak": None,
         "loss_warning_sent_at_streak": None,
         "pair_stats": seeded_pair_stats(),
+        "exchange_order_id": None,
+        "exchange_entry": None,
+        "exchange_sl": None,
+        "exchange_tp": None,
+        "sl_tp_verified_at": None,
     }
 
 
@@ -441,12 +448,20 @@ def get_open_position(symbol: str) -> dict | None:
             size = float(pos.get("size", 0))
             side = pos.get("side", "")
             if size > 0 and side in ("Buy", "Sell"):
+                take_profit = pos.get("takeProfit")
+                stop_loss = pos.get("stopLoss")
                 return {
                     "symbol": symbol,
                     "side": side,
                     "size": size,
                     "entry": float(pos.get("avgPrice", 0)),
                     "markPrice": float(pos.get("markPrice", 0) or 0),
+                    "takeProfit": float(take_profit or 0),
+                    "stopLoss": float(stop_loss or 0),
+                    "tpTriggerBy": pos.get("tpTriggerBy", ""),
+                    "slTriggerBy": pos.get("slTriggerBy", ""),
+                    "positionIdx": int(pos.get("positionIdx", 0) or 0),
+                    "raw": pos,
                 }
 
     except Exception as e:
@@ -801,12 +816,164 @@ def place_order(symbol: str, side: str, qty: float, tp: float, sl: float) -> dic
         "qty": str(qty),
         "timeInForce": "IOC",
         "positionIdx": 0,
+        "tpslMode": "Full",
         "takeProfit": str(tp),
         "stopLoss": str(sl),
         "tpTriggerBy": "MarkPrice",
         "slTriggerBy": "MarkPrice",
+        "tpOrderType": "Market",
+        "slOrderType": "Market",
     }
     return req("POST", "/v5/order/create", body=body)
+
+
+def update_trading_stop(symbol: str, tp: float, sl: float) -> dict:
+    body = {
+        "category": CATEGORY,
+        "symbol": symbol,
+        "tpslMode": "Full",
+        "positionIdx": 0,
+        "takeProfit": str(tp),
+        "stopLoss": str(sl),
+        "tpTriggerBy": "MarkPrice",
+        "slTriggerBy": "MarkPrice",
+        "tpOrderType": "Market",
+        "slOrderType": "Market",
+    }
+    return req("POST", "/v5/position/trading-stop", body=body)
+
+
+def prices_match(exchange_price: float | None, expected_price: float | None, tick_size: float) -> bool:
+    if exchange_price is None or expected_price is None:
+        return False
+    if exchange_price <= 0 or expected_price <= 0:
+        return False
+    tolerance = max(float(tick_size or 0) * 2, abs(expected_price) * 0.00001)
+    return abs(float(exchange_price) - float(expected_price)) <= tolerance
+
+
+def position_has_expected_protection(actual_pos: dict, expected_sl: float, expected_tp: float, tick_size: float) -> bool:
+    return (
+        prices_match(actual_pos.get("stopLoss"), expected_sl, tick_size)
+        and prices_match(actual_pos.get("takeProfit"), expected_tp, tick_size)
+    )
+
+
+def wait_for_open_position(symbol: str, expected_side: str, min_qty: float, attempts: int = 8, delay: float = 1.0) -> dict | None:
+    for attempt in range(1, attempts + 1):
+        actual_pos = get_open_position(symbol)
+        if actual_pos and actual_pos.get("side") == expected_side and float(actual_pos.get("size") or 0) > 0:
+            actual_qty = float(actual_pos.get("size") or 0)
+            if actual_qty + 1e-12 >= min_qty * 0.50:
+                log(
+                    "FILL_VERIFY",
+                    f"{symbol} {expected_side} open size={actual_qty} entry={actual_pos.get('entry')} attempt={attempt}",
+                )
+                return actual_pos
+        time.sleep(delay)
+    return None
+
+
+def set_and_verify_trading_stop(
+    symbol: str,
+    side: str,
+    expected_sl: float,
+    expected_tp: float,
+    tick_size: float,
+    attempts: int = 5,
+) -> tuple[bool, dict | None, str]:
+    actual_pos = get_open_position(symbol)
+    if not actual_pos:
+        return False, None, "position not open"
+
+    if actual_pos.get("side") != side:
+        return False, actual_pos, f"side mismatch exchange={actual_pos.get('side')} expected={side}"
+
+    if position_has_expected_protection(actual_pos, expected_sl, expected_tp, tick_size):
+        return True, actual_pos, "existing exchange TP/SL verified"
+
+    last_response = None
+    for attempt in range(1, attempts + 1):
+        r = update_trading_stop(symbol, expected_tp, expected_sl)
+        last_response = r
+        if r.get("retCode") != 0:
+            log("TPSL_SET_FAIL", f"{symbol} attempt={attempt}/{attempts} response={r}")
+            time.sleep(1.0)
+            continue
+
+        time.sleep(1.0)
+        actual_pos = get_open_position(symbol)
+        if actual_pos and position_has_expected_protection(actual_pos, expected_sl, expected_tp, tick_size):
+            log(
+                "TPSL_VERIFY",
+                f"{symbol} verified SL={actual_pos.get('stopLoss')} TP={actual_pos.get('takeProfit')} attempt={attempt}",
+            )
+            return True, actual_pos, "exchange TP/SL set and verified"
+
+        log(
+            "TPSL_VERIFY_WAIT",
+            f"{symbol} attempt={attempt}/{attempts} expected_sl={expected_sl} expected_tp={expected_tp} "
+            f"exchange_sl={None if not actual_pos else actual_pos.get('stopLoss')} "
+            f"exchange_tp={None if not actual_pos else actual_pos.get('takeProfit')}",
+        )
+
+    return False, actual_pos, f"TP/SL not verified after set attempts; last_response={last_response}"
+
+
+def sync_position_protection_from_exchange(state: dict, actual_pos: dict, repair_missing: bool = True) -> tuple[bool, str]:
+    symbol = actual_pos["symbol"]
+    instrument = get_instrument_info(symbol)
+    if not instrument:
+        return False, "instrument info failed"
+
+    tick_size = instrument["tick_size"]
+    state_sl = state.get("sl")
+    state_tp = state.get("tp")
+    exchange_sl = float(actual_pos.get("stopLoss") or 0)
+    exchange_tp = float(actual_pos.get("takeProfit") or 0)
+
+    if exchange_sl > 0 and exchange_tp > 0:
+        state["symbol"] = symbol
+        state["pos"] = actual_pos["side"]
+        state["entry"] = float(actual_pos["entry"])
+        state["size"] = float(actual_pos["size"])
+        state["sl"] = round_price(exchange_sl, tick_size)
+        state["tp"] = round_price(exchange_tp, tick_size)
+        state["exchange_entry"] = float(actual_pos["entry"])
+        state["exchange_sl"] = exchange_sl
+        state["exchange_tp"] = exchange_tp
+        state["sl_tp_verified_at"] = iso_now()
+        save_state(state)
+        return True, "exchange TP/SL present and state synced"
+
+    if not repair_missing or state_sl is None or state_tp is None:
+        return False, "exchange TP/SL missing and state has no repair prices"
+
+    expected_sl = round_price(float(state_sl), tick_size)
+    expected_tp = round_price(float(state_tp), tick_size)
+    ok, verified_pos, detail = set_and_verify_trading_stop(
+        symbol,
+        actual_pos["side"],
+        expected_sl,
+        expected_tp,
+        tick_size,
+    )
+
+    if ok and verified_pos:
+        state["symbol"] = symbol
+        state["pos"] = verified_pos["side"]
+        state["entry"] = float(verified_pos["entry"])
+        state["size"] = float(verified_pos["size"])
+        state["sl"] = expected_sl
+        state["tp"] = expected_tp
+        state["exchange_entry"] = float(verified_pos["entry"])
+        state["exchange_sl"] = float(verified_pos.get("stopLoss") or expected_sl)
+        state["exchange_tp"] = float(verified_pos.get("takeProfit") or expected_tp)
+        state["sl_tp_verified_at"] = iso_now()
+        save_state(state)
+        return True, detail
+
+    return False, detail
 
 
 # ============================================================
@@ -1029,6 +1196,25 @@ def manage_open_position(state: dict, actual_pos: dict) -> str:
     symbol = actual_pos["symbol"]
     side = actual_pos["side"]
 
+    protection_ok, protection_detail = sync_position_protection_from_exchange(state, actual_pos, repair_missing=True)
+    if not protection_ok:
+        state["sl_tp_verified_at"] = None
+        log("TPSL_MISSING", f"{symbol} {side} -> {protection_detail}")
+        send_telegram(
+            f"CRITICAL - POSITION TP/SL NOT VERIFIED\n"
+            f"Version: {VERSION}\n"
+            f"Pair: {symbol}\n"
+            f"Side: {side}\n"
+            f"Size: {actual_pos.get('size')}\n"
+            f"Entry: {actual_pos.get('entry')}\n"
+            f"Exchange SL: {actual_pos.get('stopLoss')}\n"
+            f"Exchange TP: {actual_pos.get('takeProfit')}\n"
+            f"Detail: {protection_detail}\n\n"
+            f"{bot_record_text(state)}"
+        )
+    else:
+        log("TPSL_OK", f"{symbol} {side} -> {protection_detail}")
+
     last_price = get_price(symbol)
     mark_price = float(actual_pos["markPrice"]) if actual_pos["markPrice"] else None
     current_price = last_price if last_price is not None else (mark_price if mark_price is not None else actual_pos["entry"])
@@ -1180,21 +1366,127 @@ def run() -> str:
             )
             continue
 
+        exchange_order_id = order_res.get("result", {}).get("orderId")
+        actual_pos = wait_for_open_position(symbol, side, qty)
+
+        if not actual_pos:
+            log("ORDER_UNFILLED", f"{symbol} {side} order accepted but position not verified -> {order_res}")
+            send_telegram(
+                f"CRITICAL - ORDER ACCEPTED BUT POSITION NOT VERIFIED\n"
+                f"Version: {VERSION}\n"
+                f"Pair: {symbol}\n"
+                f"Side: {side}\n"
+                f"Order ID: {exchange_order_id}\n"
+                f"Response: {order_res}\n\n"
+                f"{bot_record_text(state)}"
+            )
+            continue
+
+        real_entry = float(actual_pos["entry"])
+        real_qty = float(actual_pos["size"])
+        final_sl = sl
+        if side == "Buy":
+            if not final_sl < real_entry:
+                log("TPSL_GEOMETRY_FAIL", f"{symbol} real_entry={real_entry} sl={final_sl}")
+                send_telegram(
+                    f"CRITICAL - INVALID SL AFTER FILL\n"
+                    f"Version: {VERSION}\n"
+                    f"Pair: {symbol}\n"
+                    f"Side: {side}\n"
+                    f"Real Entry: {real_entry}\n"
+                    f"SL: {final_sl}\n"
+                    f"Order ID: {exchange_order_id}"
+                )
+                continue
+            final_tp = round_price(real_entry + (real_entry - final_sl) * RR_RATIO, instrument["tick_size"])
+        else:
+            if not final_sl > real_entry:
+                log("TPSL_GEOMETRY_FAIL", f"{symbol} real_entry={real_entry} sl={final_sl}")
+                send_telegram(
+                    f"CRITICAL - INVALID SL AFTER FILL\n"
+                    f"Version: {VERSION}\n"
+                    f"Pair: {symbol}\n"
+                    f"Side: {side}\n"
+                    f"Real Entry: {real_entry}\n"
+                    f"SL: {final_sl}\n"
+                    f"Order ID: {exchange_order_id}"
+                )
+                continue
+            final_tp = round_price(real_entry - (final_sl - real_entry) * RR_RATIO, instrument["tick_size"])
+
+        tpsl_ok, verified_pos, tpsl_detail = set_and_verify_trading_stop(
+            symbol,
+            side,
+            final_sl,
+            final_tp,
+            instrument["tick_size"],
+        )
+
+        if not tpsl_ok or not verified_pos:
+            log("TPSL_CRITICAL", f"{symbol} {side} order_id={exchange_order_id} -> {tpsl_detail}")
+            state.update({
+                "symbol": symbol,
+                "pos": side,
+                "entry": real_entry,
+                "sl": final_sl,
+                "tp": final_tp,
+                "size": real_qty,
+                "reason": reason,
+                "opened": iso_now(),
+                "latest_balance": actual_balance,
+                "exchange_order_id": exchange_order_id,
+                "exchange_entry": real_entry,
+                "exchange_sl": None,
+                "exchange_tp": None,
+                "sl_tp_verified_at": None,
+            })
+            save_state(state)
+            send_telegram(
+                f"CRITICAL - TRADE OPEN BUT TP/SL NOT VERIFIED\n"
+                f"Version: {VERSION}\n"
+                f"Pair: {symbol}\n"
+                f"Side: {side}\n"
+                f"Order ID: {exchange_order_id}\n"
+                f"Real Entry: {real_entry}\n"
+                f"Real Qty: {real_qty}\n"
+                f"Expected SL: {final_sl}\n"
+                f"Expected TP: {final_tp}\n"
+                f"Detail: {tpsl_detail}\n\n"
+                f"CHECK BYBIT IMMEDIATELY.\n\n"
+                f"{bot_record_text(state)}"
+            )
+            continue
+
+        real_entry = float(verified_pos["entry"])
+        real_qty = float(verified_pos["size"])
+        exchange_sl = float(verified_pos.get("stopLoss") or final_sl)
+        exchange_tp = float(verified_pos.get("takeProfit") or final_tp)
+        final_sl = round_price(exchange_sl, instrument["tick_size"])
+        final_tp = round_price(exchange_tp, instrument["tick_size"])
+        est_sl_loss = estimated_sl_loss(side, real_entry, final_sl, real_qty)
+        est_sl_risk_pct = est_sl_loss / actual_balance if actual_balance > 0 else 999.0
+        gross_tp, fees_tp, net_tp = net_pnl_estimate(side, real_entry, final_tp, real_qty)
+
         state.update({
             "symbol": symbol,
             "pos": side,
-            "entry": price,
-            "sl": sl,
-            "tp": tp,
-            "size": qty,
+            "entry": real_entry,
+            "sl": final_sl,
+            "tp": final_tp,
+            "size": real_qty,
             "reason": reason,
             "opened": iso_now(),
             "latest_balance": actual_balance,
+            "exchange_order_id": exchange_order_id,
+            "exchange_entry": real_entry,
+            "exchange_sl": exchange_sl,
+            "exchange_tp": exchange_tp,
+            "sl_tp_verified_at": iso_now(),
         })
 
         save_state(state)
 
-        print_trade_details(symbol, "TRADE OPENED", side, price, sl, tp, qty, sizing_balance, reason, est_sl_loss)
+        print_trade_details(symbol, "TRADE OPENED", side, real_entry, final_sl, final_tp, real_qty, sizing_balance, reason, est_sl_loss)
 
         direction = "LONG" if side == "Buy" else "SHORT"
 
@@ -1205,10 +1497,13 @@ def run() -> str:
             f"Direction: {direction}\n"
             f"Reason: {reason}\n"
             f"BOS Level: {setup.get('bos_level')}\n"
-            f"Entry: {price:.6f}\n"
-            f"SL: {sl}\n"
-            f"TP: {tp}\n"
-            f"Qty after rounding: {qty}\n"
+            f"Order ID: {exchange_order_id}\n"
+            f"Entry: {real_entry:.6f}\n"
+            f"SL: {final_sl}\n"
+            f"TP: {final_tp}\n"
+            f"Qty after rounding: {real_qty}\n"
+            f"TP/SL Verified: Yes\n"
+            f"TP/SL Detail: {tpsl_detail}\n"
             f"Leverage: {LEVERAGE}x\n"
             f"Actual Balance: {actual_balance:.4f} USDT\n"
             f"Position Sizing: {POSITION_PCT * 100:.1f}%\n"
@@ -1271,11 +1566,13 @@ def main() -> None:
 
     actual_pos = find_any_open_position()
     if actual_pos:
-        state["symbol"] = actual_pos["symbol"]
-        state["pos"] = actual_pos["side"]
-        state["entry"] = actual_pos["entry"]
-        state["size"] = actual_pos["size"]
-        save_state(state)
+        protection_ok, protection_detail = sync_position_protection_from_exchange(state, actual_pos, repair_missing=True)
+        if not protection_ok:
+            state["symbol"] = actual_pos["symbol"]
+            state["pos"] = actual_pos["side"]
+            state["entry"] = actual_pos["entry"]
+            state["size"] = actual_pos["size"]
+            save_state(state)
 
         send_telegram(
             f"RESTART POSITION SYNC\n"
@@ -1284,7 +1581,11 @@ def main() -> None:
             f"Pair: {actual_pos['symbol']}\n"
             f"Side: {actual_pos['side']}\n"
             f"Size: {actual_pos['size']}\n"
-            f"Entry: {actual_pos['entry']}\n\n"
+            f"Entry: {actual_pos['entry']}\n"
+            f"Exchange SL: {actual_pos.get('stopLoss')}\n"
+            f"Exchange TP: {actual_pos.get('takeProfit')}\n"
+            f"TP/SL Verified: {protection_ok}\n"
+            f"TP/SL Detail: {protection_detail}\n\n"
             f"{bot_record_text(state)}"
         )
     else:
