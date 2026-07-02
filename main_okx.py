@@ -35,7 +35,7 @@ HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60
 ATR_PERIOD = 14
 RR_RATIO = 2.5
 SWING_LEN = 3
-RETEST_TOLERANCE_ATR = 0.75
+RETEST_TOLERANCE_ATR = 0.60
 SL_ATR_BUFFER_MULT = 0.25
 EMA_TREND_PERIOD = 200
 EMA_SLOPE_LOOKBACK = 5
@@ -182,13 +182,13 @@ def default_state() -> dict:
         "daily_start_wallet": None,
         "daily_realized_pnl": 0.0,
         "daily_loss_stop_active": False,
-        "total_closed_trades": 14,
-        "total_tp_hits": 6,
-        "total_sl_hits": 8,
-        "total_net_pnl": 0.2264,
-        "current_consecutive_losses": 5,
-        "max_consecutive_losses_seen": 5,
-        "latest_balance": 26.1750,
+        "total_closed_trades": 26,
+        "total_tp_hits": 10,
+        "total_sl_hits": 16,
+        "total_net_pnl": 0.298902,
+        "current_consecutive_losses": 3,
+        "max_consecutive_losses_seen": 6,
+        "latest_balance": 33.0314,
         "loss_pause_until": None,
         "loss_pause_applied_at_streak": None,
         "loss_warning_sent_at_streak": None,
@@ -205,19 +205,33 @@ def migrate_state(state: dict) -> dict:
     migrated = default_state()
     migrated.update(state)
 
-    migrated["total_closed_trades"] = int(migrated.get("total_closed_trades", 14) or 14)
-    migrated["total_tp_hits"] = int(migrated.get("total_tp_hits", 6) or 6)
-    migrated["total_sl_hits"] = int(migrated.get("total_sl_hits", 8) or 8)
-    migrated["total_net_pnl"] = float(migrated.get("total_net_pnl", 0.2264) or 0.2264)
-    migrated["latest_balance"] = float(migrated.get("latest_balance", 26.1750) or 26.1750)
+    loaded_closed_trades = int(migrated.get("total_closed_trades") or 0)
+    corrected_record_seed = False
+    if loaded_closed_trades < 26:
+        migrated["total_closed_trades"] = 26
+        migrated["total_tp_hits"] = 10
+        migrated["total_sl_hits"] = 16
+        migrated["total_net_pnl"] = 0.298902
+        migrated["current_consecutive_losses"] = 3
+        migrated["max_consecutive_losses_seen"] = 6
+        migrated["latest_balance"] = 33.0314
+        corrected_record_seed = True
+    else:
+        migrated["total_closed_trades"] = loaded_closed_trades
+        migrated["total_tp_hits"] = int(migrated.get("total_tp_hits") or 0)
+        migrated["total_sl_hits"] = int(migrated.get("total_sl_hits") or 0)
+        migrated["total_net_pnl"] = float(migrated.get("total_net_pnl") or 0.0)
+        migrated["latest_balance"] = float(migrated.get("latest_balance") or 0.0)
 
-    if "current_consecutive_losses" not in state:
-        migrated["current_consecutive_losses"] = int(state.get("consecutive_losses", 5) or 5)
+    if corrected_record_seed:
+        pass
+    elif "current_consecutive_losses" not in state:
+        migrated["current_consecutive_losses"] = int(state.get("consecutive_losses", 3) or 3)
     else:
         migrated["current_consecutive_losses"] = int(migrated.get("current_consecutive_losses") or 0)
 
     migrated["max_consecutive_losses_seen"] = max(
-        int(migrated.get("max_consecutive_losses_seen", 5) or 5),
+        int(migrated.get("max_consecutive_losses_seen", 6) or 6),
         int(migrated.get("current_consecutive_losses", 0) or 0),
     )
     migrated["loss_pause_until"] = None
